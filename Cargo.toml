@@ -1,3 +1,7 @@
+[lib]
+name = "dufs"
+crate-type = ["cdylib", "rlib"]
+
 [package]
 name = "dufs"
 version = "0.46.0"
