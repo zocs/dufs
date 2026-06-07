@@ -79,5 +79,5 @@ digest_auth = "0.3.1"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = "symbols"
