@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use async_deflate_zip::Compression;
 use clap::builder::{PossibleValue, PossibleValuesParser};
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command, ValueEnum};
 use clap_complete::{generate, Generator, Shell};
@@ -538,12 +537,12 @@ impl ValueEnum for Compress {
 }
 
 impl Compress {
-    pub fn to_compression(self) -> Compression {
+    pub fn to_compression_level(self) -> async_deflate_zip::CompressionLevel {
         match self {
-            Compress::None => Compression::none(),
-            Compress::Low => Compression::fast(),
-            Compress::Medium => Compression::default(),
-            Compress::High => Compression::best(),
+            Compress::None => async_deflate_zip::CompressionLevel::none(),
+            Compress::Low => async_deflate_zip::CompressionLevel::fast(),
+            Compress::Medium => async_deflate_zip::CompressionLevel::default(),
+            Compress::High => async_deflate_zip::CompressionLevel::best(),
         }
     }
 }

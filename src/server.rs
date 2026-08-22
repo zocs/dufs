@@ -7,7 +7,7 @@ use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try
 use crate::Args;
 
 use anyhow::{anyhow, Result};
-use async_deflate_zip::{Compression, WriterOptions, ZipWriter};
+use async_deflate_zip::{CompressionLevel, EntryOptions, ZipWriter};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
@@ -669,7 +669,7 @@ impl Server {
         let path = path.to_owned();
         let hidden = self.args.hidden.clone();
         let running = self.running.clone();
-        let compression = self.args.compress.to_compression();
+        let compression = self.args.compress.to_compression_level();
         let follow_symlinks = self.args.allow_symlink;
         let serve_path = self.args.serve_path.clone();
         tokio::spawn(async move {
@@ -1756,7 +1756,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     dir: &Path,
     access_paths: AccessPaths,
     hidden: &[String],
-    compression: Compression,
+    compression: CompressionLevel,
     follow_symlinks: bool,
     serve_path: PathBuf,
     running: Arc<AtomicBool>,
@@ -1772,7 +1772,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         move |x| x.path().symlink_metadata().is_ok() && x.file_type().is_file(),
     ))
     .await?;
-    let mut zip = ZipWriter::new(&mut *writer).with_level(compression);
+    let mut zip = ZipWriter::new(&mut *writer).with_compression_level(compression);
     for zip_path in zip_paths.into_iter() {
         let filename = match zip_path
             .strip_prefix(dir)
@@ -1783,13 +1783,22 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
             Some(v) => v,
             None => continue,
         };
-        let options = WriterOptions::from_path(&zip_path).await?;
+        let meta = std::fs::symlink_metadata(&zip_path)?;
+        let mut options = EntryOptions::file()
+            .with_mtime(meta.modified().unwrap_or_else(|_| std::time::SystemTime::now()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            options = options
+                .with_unix_permissions(meta.permissions().mode() & 0o7777)
+                .with_uid_gid(meta.uid(), meta.gid());
+        }
         let mut file = File::open(&zip_path).await?;
-        let mut entry = zip.append_file(&filename, options).await?;
+        let mut entry = zip.start_file(&filename, &options).await?;
         io::copy(&mut file, &mut entry).await?;
-        entry.close().await?;
+        entry.finish().await?;
     }
-    zip.finalize().await?;
+    zip.finish().await?;
     Ok(())
 }
 
