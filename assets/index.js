@@ -41,7 +41,10 @@ var DIR_EMPTY_NOTE;
  * @property {string} sort
  * @property {string} order
  */
-const PARAMS = Object.fromEntries(new URLSearchParams(window.location.search).entries());
+// Object.fromEntries needs Chromium 73+; this loop keeps the same semantics
+// (later duplicates win) on kernels as old as Chromium 49.
+const PARAMS = {};
+new URLSearchParams(window.location.search).forEach((value, key) => { PARAMS[key] = value; });
 
 const IFRAME_FORMATS = [
   ".pdf",
@@ -311,7 +314,7 @@ Uploader.runQueue = async () => {
     Uploader.auth = true;
     try {
       await checkAuth();
-    } catch {
+    } catch (e) {
       Uploader.auth = false;
     }
   }
@@ -421,7 +424,7 @@ function renderPathsTableHead() {
         svg = `<svg width="12" height="12" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 15a.5.5 0 0 0 .5-.5V2.707l3.146 3.147a.5.5 0 0 0 .708-.708l-4-4a.5.5 0 0 0-.708 0l-4 4a.5.5 0 1 0 .708.708L7.5 2.707V14.5a.5.5 0 0 0 .5.5z"/></svg>`
       }
     }
-    const qs = new URLSearchParams({ ...PARAMS, order, sort: item.name }).toString();
+    const qs = new URLSearchParams(Object.assign({}, PARAMS, { order, sort: item.name })).toString();
     const icon = `<span>${svg}</span>`
     return `<th class="cell-${item.name}" ${item.props}><a href="?${qs}">${item.text}${icon}</a></th>`
   }).join("\n")}
@@ -548,7 +551,7 @@ async function setupAuth() {
     $loginBtn.addEventListener("click", async () => {
       try {
         await checkAuth("login");
-      } catch { }
+      } catch (e) { }
       location.reload();
     });
   }
@@ -704,7 +707,8 @@ async function deletePath(index) {
   const file = DATA.paths[index];
   if (!file) return;
   await doDeletePath(file.name, newUrl(file.name), () => {
-    document.getElementById(`addPath${index}`)?.remove();
+    const addPathEl = document.getElementById(`addPath${index}`);
+    if (addPathEl) addPathEl.remove();
     DATA.paths[index] = null;
     if (!DATA.paths.find(v => !!v)) {
       $pathsTable.classList.add("hidden");
@@ -976,7 +980,9 @@ async function assertResOK(res) {
 }
 
 function getEncoding(contentType) {
-  const charset = contentType?.split(";")[1];
+  // Optional chaining needs Chromium 80+; kernels below that refuse to parse
+  // the whole file, so keep this construct-free.
+  const charset = contentType ? contentType.split(";")[1] : undefined;
   if (/charset/i.test(charset)) {
     let encoding = charset.split("=")[1];
     if (encoding) {
@@ -1004,3 +1010,10 @@ function decodeBase64(base64String) {
   }
   return new TextDecoder().decode(bytes);
 }
+
+// Reaching this top-level line means the kernel parsed and executed the whole
+// script, so the UI has been built — hide the fallback link from index.html.
+// Kernels too old to parse this file never run it, and the link stays visible
+// so those users can still reach the server-rendered ?noscript page.
+const $jsFallback = document.getElementById("js-fallback");
+if ($jsFallback) $jsFallback.style.display = "none";
