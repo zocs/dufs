@@ -5,6 +5,7 @@ use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
 use crate::Args;
+use multer::Multipart;
 
 use anyhow::{anyhow, Result};
 use async_deflate_zip::{CompressionLevel, EntryOptions, ZipWriter};
@@ -23,7 +24,7 @@ use hyper::{
     body::Incoming,
     header::{
         HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, RANGE,
+        CONTENT_TYPE, LOCATION, RANGE,
     },
     Method, StatusCode, Uri,
 };
@@ -40,7 +41,7 @@ use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::{fs, io};
 
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -61,6 +62,10 @@ const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
+
+/// Maximum body size (in bytes) for urlencoded form submissions (mkdir / delete).
+/// 64 KiB is generous for a small form field.
+const MAX_FORM_BODY: u64 = 65536;
 
 pub struct Server {
     args: Args,
@@ -434,6 +439,19 @@ impl Server {
                     status_not_found(&mut res);
                 }
             }
+            Method::POST => {
+                // no-JS forms post to a directory listing URL
+                if !is_dir {
+                    status_forbid(&mut res);
+                } else {
+                    let redirect_to = match req.uri().query() {
+                        Some(q) if !q.is_empty() => format!("{}?{}", req.uri().path(), q),
+                        _ => format!("{}?noscript", req.uri().path()),
+                    };
+                    self.handle_post_dir(path, &redirect_to, req, &mut res)
+                        .await?;
+                }
+            }
             method => match method.as_str() {
                 "PROPFIND" => {
                     if is_dir {
@@ -562,6 +580,155 @@ impl Server {
         }
 
         status_no_content(res);
+        Ok(())
+    }
+
+    /// Handle a no-JS form POST to a directory: multipart upload, or a
+    /// urlencoded `mkdir` / `delete` action. On success respond with a 303
+    /// redirect (PRG) back to the listing so the page refreshes and a reload
+    /// does not resubmit the form.
+    async fn handle_post_dir(
+        &self,
+        dir_path: &Path,
+        redirect_to: &str,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+
+        if content_type.starts_with("multipart/form-data") {
+            return self
+                .handle_upload_form(dir_path, redirect_to, req, res)
+                .await;
+        }
+
+        let fields = match read_form_body(req).await {
+            Ok(fields) => fields,
+            Err(_) => {
+                status_bad_request(res, "Bad Request");
+                return Ok(());
+            }
+        };
+
+        if fields.contains_key("mkdir") {
+            if !self.args.allow_upload {
+                status_forbid(res);
+                return Ok(());
+            }
+            match fields.get("name").and_then(|v| sanitize_dir_name(v)) {
+                Some(name) => {
+                    let target = dir_path.join(&name);
+                    if self.guard_root_contained(&target).await {
+                        status_forbid(res);
+                        return Ok(());
+                    }
+                    match fs::create_dir(&target).await {
+                        Ok(_) => status_redirect(res, redirect_to),
+                        Err(_) => status_bad_request(res, "Create Failed"),
+                    }
+                }
+                None => status_bad_request(res, "Invalid Name"),
+            }
+            return Ok(());
+        }
+
+        if fields.contains_key("delete") {
+            if !self.args.allow_delete {
+                status_forbid(res);
+                return Ok(());
+            }
+            match fields.get("name").and_then(|v| sanitize_dir_name(v)) {
+                Some(name) => {
+                    let target = dir_path.join(&name);
+                    if self.guard_root_contained(&target).await {
+                        status_forbid(res);
+                        return Ok(());
+                    }
+                    match fs::metadata(&target).await {
+                        Ok(meta) => {
+                            // delete directly instead of calling
+                            // handle_delete (which sets 204) so we can
+                            // return 303 redirect instead
+                            match meta.is_dir() {
+                                true => fs::remove_dir_all(&target).await?,
+                                false => fs::remove_file(&target).await?,
+                            }
+                            status_redirect(res, redirect_to);
+                        }
+                        Err(_) => status_not_found(res),
+                    }
+                }
+                None => status_bad_request(res, "Invalid Name"),
+            }
+            return Ok(());
+        }
+
+        status_bad_request(res, "Bad Request");
+        Ok(())
+    }
+
+    /// Upload files from a `multipart/form-data` body, streaming each field
+    /// to disk under `dir_path`. Fields without a filename (plain text
+    /// fields) are skipped.
+    async fn handle_upload_form(
+        &self,
+        dir_path: &Path,
+        redirect_to: &str,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        if !self.args.allow_upload {
+            status_forbid(res);
+            return Ok(());
+        }
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let boundary = match multer::parse_boundary(content_type) {
+            Ok(boundary) => boundary,
+            Err(_) => {
+                status_bad_request(res, "Missing Boundary");
+                return Ok(());
+            }
+        };
+        let mut multipart = Multipart::new(IncomingStream::new(req.into_body()), boundary);
+        let mut saved = 0u32;
+        loop {
+            let field = match multipart.next_field().await {
+                Ok(Some(field)) => field,
+                Ok(None) => break,
+                Err(_) => {
+                    status_bad_request(res, "Invalid Multipart");
+                    return Ok(());
+                }
+            };
+            let name = match field.file_name().and_then(|v| sanitize_name(v)) {
+                Some(name) => name,
+                None => continue,
+            };
+            let target = dir_path.join(&name);
+            if self.guard_root_contained(&target).await {
+                status_forbid(res);
+                return Ok(());
+            }
+            if let Err(_) = save_upload_field(&target, field).await {
+                let _ = tokio::fs::remove_file(&target).await;
+                status_bad_request(res, "Write Failed");
+                return Ok(());
+            }
+            saved += 1;
+        }
+        if saved == 0 {
+            status_bad_request(res, "No File");
+            return Ok(());
+        }
+        status_redirect(res, redirect_to);
         Ok(())
     }
 
@@ -1784,8 +1951,10 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
             None => continue,
         };
         let meta = std::fs::symlink_metadata(&zip_path)?;
-        let mut options = EntryOptions::file()
-            .with_mtime(meta.modified().unwrap_or_else(|_| std::time::SystemTime::now()));
+        let mut options = EntryOptions::file().with_mtime(
+            meta.modified()
+                .unwrap_or_else(|_| std::time::SystemTime::now()),
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1823,6 +1992,80 @@ fn status_not_found(res: &mut Response) {
 
 fn status_no_content(res: &mut Response) {
     *res.status_mut() = StatusCode::NO_CONTENT;
+}
+
+fn status_redirect(res: &mut Response, location: &str) {
+    *res.status_mut() = StatusCode::SEE_OTHER;
+    res.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static("/")),
+    );
+}
+
+/// Read a small urlencoded form body (used for mkdir / delete actions) into a
+/// map. The body is capped to keep memory bounded.
+async fn read_form_body(req: Request) -> Result<HashMap<String, String>> {
+    let stream = IncomingStream::new(req.into_body());
+    let body_with_io_error = stream.map_err(io::Error::other);
+    let body_reader = StreamReader::new(body_with_io_error);
+    pin_mut!(body_reader);
+    let mut bytes = Vec::new();
+    body_reader
+        .take(MAX_FORM_BODY)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(form_urlencoded::parse(&bytes)
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect())
+}
+
+/// Reduce an untrusted upload filename to a single safe path component
+/// (basename only). Returns `None` for empty, `.`/`..`, or `\0` names.
+fn sanitize_name(name: &str) -> Option<String> {
+    let name = name.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    validate_name_component(name).map(str::to_string)
+}
+
+/// Strict variant for mkdir / delete forms: reject any input that is not a
+/// plain single path component (no separators, no traversal).
+fn sanitize_dir_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.contains(['/', '\\']) {
+        return None;
+    }
+    validate_name_component(name).map(str::to_string)
+}
+
+fn validate_name_component(name: &str) -> Option<&str> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('\0') {
+        return None;
+    }
+    if cfg!(windows) {
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        const RESERVED: &[&str] = &[
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if RESERVED.contains(&stem.as_str()) {
+            return None;
+        }
+    }
+    Some(name)
+}
+
+/// Stream a multipart file field to disk.
+async fn save_upload_field(target: &Path, mut field: multer::Field<'_>) -> Result<()> {
+    ensure_path_parent(target).await?;
+    let mut file = fs::File::create(target).await?;
+    while let Some(chunk) = field.chunk().await.map_err(anyhow::Error::new)? {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
 }
 
 fn status_bad_request(res: &mut Response, body: &str) {
