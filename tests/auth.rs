@@ -75,6 +75,97 @@ fn auth_digest_replay(
     Ok(())
 }
 
+#[cfg(feature = "tls")]
+#[rstest]
+#[case::http1(false, reqwest::Version::HTTP_11)]
+#[case::http2(true, reqwest::Version::HTTP_2)]
+fn auth_digest_tls_request_target(
+    #[with(&[
+        "--auth", "user:pass@/:rw", "-A",
+        "--tls-cert", "tests/data/cert.pem",
+        "--tls-key", "tests/data/key_pkcs8.pem",
+    ])]
+    server: TestServer,
+    #[case] http2: bool,
+    #[case] version: reqwest::Version,
+) -> Result<(), Error> {
+    let builder = reqwest::blocking::Client::builder().tls_danger_accept_invalid_certs(true);
+    let client = if http2 {
+        builder.http2_prior_knowledge()
+    } else {
+        builder.http1_only()
+    }
+    .build()?;
+    let url = format!("{}dir1/test.txt?download", server.url());
+    let resp = send_with_digest_auth(client.get(&url), "user", "pass")?;
+    assert_eq!(resp.version(), version);
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is dir1/test.txt");
+    Ok(())
+}
+
+#[rstest]
+#[case::absolute_uri(true, "download", 200)]
+#[case::origin_form_uri(false, "download", 401)]
+#[case::wrong_query(true, "other", 401)]
+fn auth_digest_http1_absolute_form(
+    #[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer,
+    #[case] absolute_digest_uri: bool,
+    #[case] digest_query: &str,
+    #[case] expected_status: u16,
+) -> Result<(), Error> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let target = format!("{}dir1/test.txt?download", server.url());
+    let raw_get = |authorization: Option<&str>| -> Result<String, Error> {
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let auth_header = authorization
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default();
+        stream.write_all(
+            format!(
+                "GET {target} HTTP/1.1\r\nHost: localhost:{}\r\n{auth_header}Connection: close\r\n\r\n",
+                server.port()
+            )
+            .as_bytes(),
+        )?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    };
+    let challenge = raw_get(None)?;
+    assert!(challenge.starts_with("HTTP/1.1 401 "), "{challenge}");
+    let digest_challenge = challenge
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, value)| {
+            name.eq_ignore_ascii_case("www-authenticate") && value.trim().starts_with("Digest ")
+        })
+        .unwrap()
+        .1
+        .trim();
+    let digest_uri = if absolute_digest_uri {
+        format!("{}dir1/test.txt?{digest_query}", server.url())
+    } else {
+        format!("/dir1/test.txt?{digest_query}")
+    };
+    let mut prompt = digest_auth::parse(digest_challenge)?;
+    let context = digest_auth::AuthContext::new("user", "pass", &digest_uri);
+    let authorization = prompt.respond(&context)?.to_header_string();
+    let response = raw_get(Some(&authorization))?;
+    assert!(
+        response.starts_with(&format!("HTTP/1.1 {expected_status} ")),
+        "{response}"
+    );
+    if expected_status == 200 {
+        assert!(response.ends_with("This is dir1/test.txt"), "{response}");
+    }
+    Ok(())
+}
+
 #[rstest]
 fn invalid_auth(
     #[with(&["-a", "user:pass@/:rw", "-a", "@/", "-A"])] server: TestServer,
@@ -321,6 +412,251 @@ fn auth_webdav_copy(
         "pass3",
     )?;
     assert_eq!(resp.status(), 403);
+    Ok(())
+}
+
+#[rstest]
+#[case::move_file(b"MOVE", false)]
+#[case::copy_file(b"COPY", true)]
+fn auth_digest_webdav_between_permission_roots(
+    #[with(&["--auth", "user:pass@/dir1:rw,/dir2:rw", "-A"])] server: TestServer,
+    #[case] method: &[u8],
+    #[case] source_remains: bool,
+) -> Result<(), Error> {
+    let source_url = format!("{}dir1/test.txt", server.url());
+    let dest_url = format!("{}dir2/transferred.txt", server.url());
+    let challenge = reqwest::blocking::Client::new()
+        .request(reqwest::Method::from_bytes(method)?, &source_url)
+        .header("Destination", &dest_url)
+        .send()?;
+    assert_eq!(challenge.status(), 401);
+    let authorization = digest_authorization(
+        reqwest::blocking::Client::new()
+            .request(reqwest::Method::from_bytes(method)?, &source_url)
+            .header("Destination", &dest_url),
+        &challenge,
+        "user",
+        "pass",
+    )?;
+    let resp = reqwest::blocking::Client::new()
+        .request(reqwest::Method::from_bytes(method)?, &source_url)
+        .header("Destination", &dest_url)
+        .header("Authorization", &authorization)
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("dir2/transferred.txt"))?,
+        "This is dir1/test.txt"
+    );
+    assert_eq!(server.path().join("dir1/test.txt").exists(), source_remains);
+
+    // Checking destination permission must not disable request replay checks.
+    let replay = reqwest::blocking::Client::new()
+        .request(reqwest::Method::from_bytes(method)?, &source_url)
+        .header("Destination", &dest_url)
+        .header("Authorization", &authorization)
+        .send()?;
+    assert_eq!(replay.status(), 401);
+    Ok(())
+}
+
+#[rstest]
+#[case::move_readonly(b"MOVE", "dir2/private/test.txt")]
+#[case::copy_readonly(b"COPY", "dir2/private/test.txt")]
+#[case::move_unlisted(b"MOVE", "dir3/test.txt")]
+#[case::copy_unlisted(b"COPY", "dir3/test.txt")]
+fn auth_digest_webdav_destination_denied(
+    #[with(&["--auth", "user:pass@/dir1:rw,/dir2:rw,/dir2/private:ro", "-A"])] server: TestServer,
+    #[case] method: &[u8],
+    #[case] destination: &str,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("dir2/private"))?;
+    std::fs::write(server.path().join(destination), "destination stays")?;
+    let resp = send_with_digest_auth(
+        reqwest::blocking::Client::new()
+            .request(
+                reqwest::Method::from_bytes(method)?,
+                format!("{}dir1/test.txt", server.url()),
+            )
+            .header("Destination", format!("{}{destination}", server.url())),
+        "user",
+        "pass",
+    )?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(
+        std::fs::read_to_string(server.path().join(destination))?,
+        "destination stays"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("dir1/test.txt"))?,
+        "This is dir1/test.txt"
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::move_file(b"MOVE")]
+#[case::copy_file(b"COPY")]
+fn auth_digest_webdav_inherits_anonymous_destination(
+    #[with(&["--auth", "user:pass@/dir1:rw", "--auth", "@/dir2:rw", "-A"])] server: TestServer,
+    #[case] method: &[u8],
+) -> Result<(), Error> {
+    let resp = send_with_digest_auth(
+        reqwest::blocking::Client::new()
+            .request(
+                reqwest::Method::from_bytes(method)?,
+                format!("{}dir1/test.txt", server.url()),
+            )
+            .header(
+                "Destination",
+                format!("{}dir2/transferred.txt", server.url()),
+            ),
+        "user",
+        "pass",
+    )?;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("dir2/transferred.txt"))?,
+        "This is dir1/test.txt"
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::move_allowed(b"MOVE", "dir2/transferred.txt", 204)]
+#[case::copy_allowed(b"COPY", "dir2/transferred.txt", 204)]
+#[case::move_denied(b"MOVE", "dir3/transferred.txt", 403)]
+#[case::copy_denied(b"COPY", "dir3/transferred.txt", 403)]
+fn auth_anonymous_webdav_destination(
+    #[with(&["--auth", "@/dir1:rw,/dir2:rw", "-A"])] server: TestServer,
+    #[case] method: &[u8],
+    #[case] destination: &str,
+    #[case] status: u16,
+) -> Result<(), Error> {
+    let resp = reqwest::blocking::Client::new()
+        .request(
+            reqwest::Method::from_bytes(method)?,
+            format!("{}dir1/test.txt", server.url()),
+        )
+        .header("Destination", format!("{}{destination}", server.url()))
+        .send()?;
+    assert_eq!(resp.status(), status);
+    if status == 204 {
+        assert_eq!(
+            std::fs::read_to_string(server.path().join(destination))?,
+            "This is dir1/test.txt"
+        );
+    } else {
+        assert!(!server.path().join(destination).exists());
+        assert!(server.path().join("dir1/test.txt").exists());
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::basic(server(&["--auth", "user:pass@/source:rw,/destination:rw,/destination/private:ro", "-A"]), "basic")]
+#[case::digest(server(&["--auth", "user:pass@/source:rw,/destination:rw,/destination/private:ro", "-A"]), "digest")]
+#[case::anonymous(server(&["--auth", "@/source:rw,/destination:rw,/destination/private:ro", "-A"]), "anonymous")]
+fn auth_directory_move_denied_by_destination_descendant(
+    #[case] server: TestServer,
+    #[case] authentication: &str,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("source/private"))?;
+    std::fs::write(server.path().join("source/private/new.txt"), "source stays")?;
+    assert!(!server.path().join("destination").exists());
+    let send =
+        |request: reqwest::blocking::RequestBuilder| -> Result<reqwest::blocking::Response, Error> {
+            match authentication {
+                "basic" => Ok(request.basic_auth("user", Some("pass")).send()?),
+                "digest" => Ok(send_with_digest_auth(request, "user", "pass")?),
+                "anonymous" => Ok(request.send()?),
+                _ => unreachable!(),
+            }
+        };
+    let direct = send(
+        fetch!(
+            b"PUT",
+            format!("{}destination/private/new.txt", server.url())
+        )
+        .body("forbidden"),
+    )?;
+    assert_eq!(
+        direct.status(),
+        if authentication == "anonymous" {
+            401
+        } else {
+            403
+        }
+    );
+    assert!(!server.path().join("destination").exists());
+    let moved = send(
+        fetch!(b"MOVE", format!("{}source", server.url()))
+            .header("Destination", format!("{}destination", server.url())),
+    )?;
+    assert_eq!(moved.status(), 403);
+    assert_eq!(error_code(&moved), Some("readonly-descendant"));
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("source/private/new.txt"))?,
+        "source stays"
+    );
+    assert!(!server.path().join("destination").exists());
+
+    let directory_copy = send(
+        fetch!(b"COPY", format!("{}source", server.url()))
+            .header("Destination", format!("{}destination", server.url())),
+    )?;
+    assert_eq!(directory_copy.status(), 403);
+    assert_eq!(error_code(&directory_copy), Some("is-a-directory"));
+    assert!(!server.path().join("destination").exists());
+
+    // The restriction is for recursive writes. A permitted file destination
+    // remains writable even when its rule subtree contains a read-only child.
+    let copied = send(
+        fetch!(b"COPY", format!("{}source/private/new.txt", server.url()))
+            .header("Destination", format!("{}destination", server.url())),
+    )?;
+    assert_eq!(copied.status(), 204);
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("destination"))?,
+        "source stays"
+    );
+    let file_move = send(
+        fetch!(b"MOVE", format!("{}source/private/new.txt", server.url()))
+            .header("Destination", format!("{}destination", server.url())),
+    )?;
+    assert_eq!(file_move.status(), 204);
+    assert!(!server.path().join("source/private/new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("destination"))?,
+        "source stays"
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::basic(server(&["--auth", "user:pass@/source:rw,/destination:rw", "-A"]), "basic")]
+#[case::digest(server(&["--auth", "user:pass@/source:rw,/destination:rw", "-A"]), "digest")]
+#[case::anonymous(server(&["--auth", "@/source:rw,/destination:rw", "-A"]), "anonymous")]
+fn auth_directory_move_allowed_without_destination_descendant(
+    #[case] server: TestServer,
+    #[case] authentication: &str,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("source/private"))?;
+    std::fs::write(server.path().join("source/private/new.txt"), "moved")?;
+    let request = fetch!(b"MOVE", format!("{}source", server.url()))
+        .header("Destination", format!("{}destination", server.url()));
+    let moved = match authentication {
+        "basic" => request.basic_auth("user", Some("pass")).send()?,
+        "digest" => send_with_digest_auth(request, "user", "pass")?,
+        "anonymous" => request.send()?,
+        _ => unreachable!(),
+    };
+    assert_eq!(moved.status(), 204);
+    assert!(!server.path().join("source").exists());
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("destination/private/new.txt"))?,
+        "moved"
+    );
     Ok(())
 }
 

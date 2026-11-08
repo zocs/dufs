@@ -186,7 +186,19 @@ impl Server {
         }
 
         let authorization = headers.get(AUTHORIZATION);
-        let request_target = req.uri().to_string();
+        // HTTP/2 carries scheme and authority separately from the Digest URI.
+        // Hyper reconstructs an absolute URI for HTTP/2, whose request target
+        // is :path. HTTP/1 must retain the actual origin- or absolute-form URI.
+        let request_target = if req.version() == hyper::Version::HTTP_2 {
+            Cow::Borrowed(
+                req.uri()
+                    .path_and_query()
+                    .map(|target| target.as_str())
+                    .unwrap_or("/"),
+            )
+        } else {
+            Cow::Owned(req.uri().to_string())
+        };
 
         let query = req.uri().query().unwrap_or_default();
         let mut query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
@@ -535,7 +547,8 @@ impl Server {
                     } else if is_miss {
                         status_not_found(&mut res);
                     } else {
-                        self.handle_copy(path, &req, &mut res).await?
+                        self.handle_copy(path, &req, user.as_deref(), &mut res)
+                            .await?
                     }
                 }
                 "MOVE" => {
@@ -548,7 +561,8 @@ impl Server {
                     } else if is_dir && Self::has_restricted_descendant(&access_paths) {
                         DufsErrorCode::ReadonlyDescendant.respond(&mut res);
                     } else {
-                        self.handle_move(path, &req, &mut res).await?
+                        self.handle_move(path, is_dir, &req, user.as_deref(), &mut res)
+                            .await?
                     }
                 }
                 "LOCK" => {
@@ -782,7 +796,7 @@ impl Server {
                     return Ok(());
                 }
             };
-            let name = match field.file_name().and_then(|v| sanitize_name(v)) {
+            let name = match field.file_name().and_then(sanitize_name) {
                 Some(name) => name,
                 None => continue,
             };
@@ -808,7 +822,7 @@ impl Server {
                     return Ok(());
                 }
             }
-            if let Err(_) = save_upload_field(&target, field).await {
+            if save_upload_field(&target, field).await.is_err() {
                 let _ = tokio::fs::remove_file(&target).await;
                 status_bad_request(res, "Write Failed");
                 return Ok(());
@@ -1554,9 +1568,15 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_copy(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res).await {
-            Some(dest) => dest,
+    async fn handle_copy(
+        &self,
+        path: &Path,
+        req: &Request,
+        user: Option<&str>,
+        res: &mut Response,
+    ) -> Result<()> {
+        let dest = match self.extract_dest(req, user, res).await {
+            Some((dest, _)) => dest,
             None => {
                 return Ok(());
             }
@@ -1597,8 +1617,15 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_move(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res).await {
+    async fn handle_move(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        req: &Request,
+        user: Option<&str>,
+        res: &mut Response,
+    ) -> Result<()> {
+        let (dest, dest_access_paths) = match self.extract_dest(req, user, res).await {
             Some(dest) => dest,
             None => {
                 return Ok(());
@@ -1607,6 +1634,11 @@ impl Server {
 
         if self.guard_root_contained(&dest).await {
             DufsErrorCode::InvalidDestination.respond(res);
+            return Ok(());
+        }
+
+        if is_dir && Self::has_restricted_descendant(&dest_access_paths) {
+            DufsErrorCode::ReadonlyDescendant.respond(res);
             return Ok(());
         }
 
@@ -1801,7 +1833,12 @@ impl Server {
             .unwrap_or_default()
     }
 
-    async fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
+    async fn extract_dest(
+        &self,
+        req: &Request,
+        user: Option<&str>,
+        res: &mut Response,
+    ) -> Option<(PathBuf, AccessPaths)> {
         let headers = req.headers();
         let dest_path = match self
             .extract_destination_header(headers)
@@ -1814,25 +1851,14 @@ impl Server {
             }
         };
 
-        let authorization = headers.get(AUTHORIZATION);
-        let request_target = req.uri().to_string();
-        let guard = self
+        let dest_access_paths = match self
             .args
             .auth
-            .guard(
-                &dest_path,
-                req.method(),
-                &request_target,
-                authorization,
-                None,
-                false,
-                &self.args.serve_path,
-            )
-            .await;
-
-        match guard {
-            (_, Some(_), _, _) => {}
-            _ => {
+            .guard_write(user, &dest_path, &self.args.serve_path)
+            .await
+        {
+            Some(access_paths) => access_paths,
+            None => {
                 DufsErrorCode::Forbidden.respond(res);
                 return None;
             }
@@ -1846,7 +1872,7 @@ impl Server {
             }
         };
 
-        Some(dest)
+        Some((dest, dest_access_paths))
     }
 
     fn extract_destination_header(&self, headers: &HeaderMap<HeaderValue>) -> Option<String> {

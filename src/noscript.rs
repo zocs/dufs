@@ -5,7 +5,7 @@ use crate::{
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use xml::escape::escape_str_pcdata;
+use xml::escape::{escape_str_attribute, escape_str_pcdata};
 
 pub fn detect_noscript(user_agent: &str) -> bool {
     [
@@ -75,7 +75,7 @@ fn render_upload_form() -> String {
   <input type="text" name="name" placeholder="Folder name">
   <button type="submit">New folder</button>
 </form></div>"#
-    .to_string()
+        .to_string()
 }
 
 fn render_parent(allow_delete: bool) -> String {
@@ -104,7 +104,7 @@ fn render_path_item(path: &PathItem, allow_delete: bool) -> String {
   <input type="hidden" name="name" value="{}">
   <button type="submit">Del</button>
 </form></td>"#,
-            escape_str_pcdata(&path.name)
+            escape_str_attribute(&path.name)
         )
     } else {
         String::new()

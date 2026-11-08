@@ -245,6 +245,26 @@ impl AccessControl {
             .is_some_and(|access_paths| !access_paths.perm().indexonly())
     }
 
+    /// Resolve write permission against the authenticated identity's full
+    /// rules, including anonymous permissions, without validating credentials
+    /// again. Retain the guarded subtree so recursive writes can reject more
+    /// restrictive descendant rules.
+    pub async fn guard_write(
+        &self,
+        user: Option<&str>,
+        path: &str,
+        root: &Path,
+    ) -> Option<AccessPaths> {
+        if self.empty {
+            return Some(AccessPaths::new(AccessPerm::ReadWrite));
+        }
+        let access_paths = match user {
+            Some(user) => &self.users.get(user)?.1,
+            None => self.anonymous.as_ref()?,
+        };
+        access_paths.guard(path, &Method::PUT, Some(root)).await
+    }
+
     pub fn generate_token(&self, path: &str, user: &str) -> Result<String> {
         let (pass, _) = self
             .users

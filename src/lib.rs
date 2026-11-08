@@ -1,11 +1,8 @@
-﻿// lib.rs — FFI wrapper for dufs
+// lib.rs — FFI wrapper for dufs
 // Exposes dufs_start / dufs_stop for embedding in Flutter (dart:ffi)
 
 #[macro_use]
 extern crate log;
-
-// Re-export log macros for sub-modules (needed in Rust 2021 edition)
-pub(crate) use log::{debug, error, info, trace, warn};
 
 mod args;
 mod auth;
@@ -45,8 +42,12 @@ static SHUTDOWN_TX: Mutex<Option<broadcast::Sender<()>>> = Mutex::new(None);
 
 /// Start the dufs server with argv-style args.
 /// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `argv` must point to `argc` readable pointers to valid NUL-terminated strings
+/// for the duration of this call. Null pointers and invalid UTF-8 return -1.
 #[no_mangle]
-pub extern "C" fn dufs_start(argc: i32, argv: *const *const c_char) -> i32 {
+pub unsafe extern "C" fn dufs_start(argc: i32, argv: *const *const c_char) -> i32 {
     // Never let a panic unwind across the C ABI boundary. This cdylib is built
     // with panic="unwind" (Cargo.toml [profile.release]); catch_unwind converts
     // any panic in the startup path into a clean -1 instead of aborting the
@@ -89,13 +90,13 @@ pub extern "C" fn dufs_start(argc: i32, argv: *const *const c_char) -> i32 {
 #[no_mangle]
 pub extern "C" fn dufs_stop() {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Ok(mut guard) = RUNNING.lock() {
+        if let Ok(guard) = RUNNING.lock() {
             if let Some(ref running) = *guard {
                 running.store(false, Ordering::SeqCst);
             }
         }
         // Wake up all blocking accept() calls
-        if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+        if let Ok(guard) = SHUTDOWN_TX.lock() {
             if let Some(ref tx) = *guard {
                 let _ = tx.send(());
             }
@@ -140,7 +141,9 @@ pub extern "C" fn dufs_is_running() -> i32 {
 fn start_inner(argv: &[String]) -> Result<()> {
     // Prevent double-start: if a server is already running, stop it first
     {
-        let running_guard = RUNNING.lock().map_err(|_| anyhow!("RUNNING lock poisoned"))?;
+        let running_guard = RUNNING
+            .lock()
+            .map_err(|_| anyhow!("RUNNING lock poisoned"))?;
         if running_guard.is_some() {
             drop(running_guard);
             // Clean up the old server before starting a new one
@@ -178,10 +181,12 @@ fn start_inner(argv: &[String]) -> Result<()> {
     let handle = rt.handle().clone();
 
     // Spawn server tasks on the runtime
-    let _handles = handle.block_on(async {
-        serve_on_runtime(args, running.clone(), shutdown_tx)
-    })?;
-    eprintln!("[dufs-ffi] Server started with {} listeners", _handles.len());
+    let _handles =
+        handle.block_on(async { serve_on_runtime(args, running.clone(), shutdown_tx) })?;
+    eprintln!(
+        "[dufs-ffi] Server started with {} listeners",
+        _handles.len()
+    );
 
     // Keep the runtime alive — store it in the static AFTER spawning tasks.
     if let Ok(mut guard) = RUNTIME.lock() {
@@ -215,7 +220,7 @@ fn serve_on_runtime(
         let server_handle = server_handle.clone();
         match bind_addr {
             BindAddr::IpAddr(ip) => {
-                let mut listener = create_listener(SocketAddr::new(*ip, port))?;
+                let listener = create_listener(SocketAddr::new(*ip, port))?;
                 let mut shutdown_rx = shutdown_tx.subscribe();
                 let handle = tokio::spawn(async move {
                     loop {
@@ -245,7 +250,7 @@ fn serve_on_runtime(
                     let _ = std::fs::remove_file(path);
                     path.into()
                 };
-                let mut listener = tokio::net::UnixListener::bind(socket_path)?;
+                let listener = tokio::net::UnixListener::bind(socket_path)?;
                 let mut shutdown_rx = shutdown_tx.subscribe();
                 let handle = tokio::spawn(async move {
                     loop {
@@ -267,11 +272,8 @@ fn serve_on_runtime(
     Ok(handles)
 }
 
-async fn handle_stream<T>(
-    handle: Arc<Server>,
-    stream: TokioIo<T>,
-    addr: Option<SocketAddr>,
-) where
+async fn handle_stream<T>(handle: Arc<Server>, stream: TokioIo<T>, addr: Option<SocketAddr>)
+where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let hyper_service =
@@ -321,8 +323,12 @@ fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
                 last_err = Some(e);
                 if attempt < 7 {
                     let delay = 200 * (attempt + 1) as u64;
-                    eprintln!("[dufs-ffi] bind {} failed (attempt {}), retrying in {}ms...",
-                        addr, attempt + 1, delay);
+                    eprintln!(
+                        "[dufs-ffi] bind {} failed (attempt {}), retrying in {}ms...",
+                        addr,
+                        attempt + 1,
+                        delay
+                    );
                     thread::sleep(Duration::from_millis(delay));
                 }
             }

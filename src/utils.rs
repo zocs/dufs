@@ -1,4 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+
+#[cfg(feature = "tls")]
+use anyhow::Context;
 
 #[cfg(feature = "tls")]
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -65,6 +68,8 @@ pub fn join_within(base: &Path, relative: &str) -> Option<PathBuf> {
 
 // Load public certificate from file.
 #[cfg(feature = "tls")]
+// Used by the binary's TLS listener; the FFI listener serves plain HTTP.
+#[allow(dead_code)]
 pub fn load_certs<T: AsRef<Path>>(file_name: T) -> Result<Vec<CertificateDer<'static>>> {
     let mut certs = vec![];
     for cert in CertificateDer::pem_file_iter(file_name.as_ref()).with_context(|| {
@@ -92,6 +97,8 @@ pub fn load_certs<T: AsRef<Path>>(file_name: T) -> Result<Vec<CertificateDer<'st
 
 // Load private key from file.
 #[cfg(feature = "tls")]
+// Used by the binary's TLS listener; the FFI listener serves plain HTTP.
+#[allow(dead_code)]
 pub fn load_private_key<T: AsRef<Path>>(file_name: T) -> Result<PrivateKeyDer<'static>> {
     PrivateKeyDer::from_pem_file(file_name.as_ref()).with_context(|| {
         format!(

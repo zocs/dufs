@@ -255,6 +255,8 @@ pub fn build_cli() -> Command {
     app
 }
 
+// The binary prints completions; the FFI library only parses server arguments.
+#[allow(dead_code)]
 pub fn print_completions<G: Generator>(gen: G, cmd: &mut Command) {
     generate(gen, cmd, cmd.get_name().to_string(), &mut std::io::stdout());
 }

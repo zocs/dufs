@@ -31,7 +31,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+#[cfg(feature = "tls")]
 use std::time::Duration;
+#[cfg(feature = "tls")]
 use tokio::time::timeout;
 use tokio::{net::TcpListener, task::JoinHandle};
 #[cfg(feature = "tls")]

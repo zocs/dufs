@@ -33,6 +33,59 @@ fn noscript_page_no_forms(server: TestServer) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+#[rstest]
+#[case::quoted_name("a\"&<'quoted.txt")]
+#[case::attribute_injection("a\" autofocus=\"\" onfocus=\"alert(1)&<'.txt")]
+fn delete_form_filename_round_trip(
+    #[with(&["-A"])] server: TestServer,
+    #[case] filename: &str,
+) -> Result<(), Error> {
+    let upload = client()
+        .put(format!("{}{}", server.url(), utils::encode_uri(filename)))
+        .body("uploaded")
+        .send()?;
+    assert_eq!(upload.status(), 201);
+    let page = client()
+        .get(format!("{}?noscript", server.url()))
+        .send()?
+        .text()?;
+    let mut found = false;
+    for line in page.lines().filter(|line| {
+        line.trim_start()
+            .starts_with("<input type=\"hidden\" name=\"name\"")
+    }) {
+        // These input tags use XML-compatible attributes. Close the void tag
+        // to parse its attribute values and detect injected extra attributes.
+        let fragment = format!("{}/>", line.trim().trim_end_matches('>'));
+        for event in xml::reader::EventReader::from_str(&fragment) {
+            if let xml::reader::XmlEvent::StartElement { attributes, .. } = event? {
+                assert_eq!(attributes.len(), 3, "unexpected attributes: {line}");
+                let value = attributes
+                    .iter()
+                    .find(|attribute| attribute.name.local_name == "value")
+                    .unwrap();
+                if value.value == filename {
+                    found = true;
+                    let deleted = client()
+                        .post(format!("{}?noscript", server.url()))
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(format!(
+                            "delete=1&name={}",
+                            urlencoding::encode(&value.value)
+                        ))
+                        .send()?;
+                    assert_eq!(deleted.status(), 303);
+                    assert!(!server.path().join(filename).exists());
+                    assert!(server.path().join("test.txt").exists());
+                }
+            }
+        }
+    }
+    assert!(found, "filename did not round-trip through the delete form");
+    Ok(())
+}
+
 #[rstest]
 fn upload_file(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let form = Form::new().part(
@@ -216,14 +269,19 @@ fn post_empty_form(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
-fn upload_overwrite_needs_delete(#[with(&["--allow-upload"])] server: TestServer) -> Result<(), Error> {
+fn upload_overwrite_needs_delete(
+    #[with(&["--allow-upload"])] server: TestServer,
+) -> Result<(), Error> {
     let form = Form::new().part("file", Part::bytes(b"new".to_vec()).file_name("test.txt"));
     let resp = client()
         .post(format!("{}?noscript", server.url()))
         .multipart(form)
         .send()?;
     assert_eq!(resp.status(), 403);
-    assert_eq!(resp.headers().get("x-dufs-error-code").unwrap(), "delete-disabled");
+    assert_eq!(
+        resp.headers().get("x-dufs-error-code").unwrap(),
+        "delete-disabled"
+    );
     assert_eq!(
         std::fs::read_to_string(server.path().join("test.txt"))?,
         "This is test.txt"
@@ -256,7 +314,10 @@ fn delete_dir_with_readonly_descendant(
         .body("delete=1&name=dir1")
         .send()?;
     assert_eq!(resp.status(), 403);
-    assert_eq!(resp.headers().get("x-dufs-error-code").unwrap(), "readonly-descendant");
+    assert_eq!(
+        resp.headers().get("x-dufs-error-code").unwrap(),
+        "readonly-descendant"
+    );
     assert!(server.path().join("dir1/sub").exists());
     Ok(())
 }

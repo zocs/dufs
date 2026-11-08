@@ -1,3 +1,5 @@
+#![cfg(feature = "tls")]
+
 mod fixtures;
 mod utils;
 
