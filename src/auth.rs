@@ -13,7 +13,7 @@ use sha_crypt::PasswordVerifier;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use uuid::Uuid;
 
@@ -31,6 +31,8 @@ const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
 /// stack overflow (which aborts the process under `panic = "abort"`).
 const MAX_ACCESS_PATH_DEPTH: usize = 128;
 
+type NonceCounts = HashMap<(String, String), (u32, u64)>;
+
 lazy_static! {
     static ref NONCESTARTHASH: Context = {
         let mut h = Context::new();
@@ -42,8 +44,7 @@ lazy_static! {
     /// time at which the entry can be dropped. Digest replay protection relies
     /// on this table: a nonce may be used many times (with increasing counts),
     /// but the same count must never be accepted twice.
-    static ref NONCE_COUNTS: Mutex<HashMap<(String, String), (u32, u64)>> =
-        Mutex::new(HashMap::new());
+    static ref NONCE_COUNTS: Mutex<NonceCounts> = Mutex::new(HashMap::new());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +117,15 @@ impl AccessControl {
                 use_hashed_password = true;
             }
             users.insert(user.to_string(), (pass.to_string(), access_paths));
+        }
+
+        // Guarded subtrees retain the complete policy for aliases that cross
+        // branch boundaries. Snapshots have no snapshot of their own.
+        for (_, paths) in users.values_mut() {
+            paths.retain_policy();
+        }
+        if let Some(paths) = anonymous.as_mut() {
+            paths.retain_policy();
         }
 
         Ok(Self {
@@ -317,6 +327,7 @@ impl AccessControl {
 pub struct AccessPaths {
     perm: AccessPerm,
     children: IndexMap<String, AccessPaths>,
+    policy: Option<Arc<AccessPaths>>,
 }
 
 impl AccessPaths {
@@ -335,6 +346,10 @@ impl AccessPaths {
         if !perm.indexonly() {
             self.perm = perm;
         }
+    }
+
+    fn retain_policy(&mut self) {
+        self.policy = Some(Arc::new(self.clone()));
     }
 
     pub fn merge(&mut self, paths: &str) -> Option<()> {
@@ -361,7 +376,27 @@ impl AccessPaths {
     /// [`Self::has_stricter_descendant`] to find rules the request path alone
     /// does not reveal.
     pub async fn guard(&self, path: &str, method: &Method, root: Option<&Path>) -> Option<Self> {
-        let target = match self.resolve(path, root).await {
+        let mut target = self.resolve_target(path, root).await?;
+        if let Some(root) = root {
+            if let Some(real_path) = canonical_relative_path(root, path).await {
+                if real_path != path.trim_matches('/') {
+                    let policy = self.policy.as_deref().unwrap_or(self);
+                    let canonical = policy.resolve_target(&real_path, Some(root)).await?;
+                    // A different route to an object must not bypass either
+                    // route's restrictions, including descendant rules.
+                    target.intersect(&canonical, target.perm, canonical.perm);
+                }
+            }
+        }
+        if !is_readonly_method(method) && !target.perm().readwrite() {
+            return None;
+        }
+        target.policy = self.policy.clone();
+        Some(target)
+    }
+
+    async fn resolve_target(&self, path: &str, root: Option<&Path>) -> Option<Self> {
+        Some(match self.resolve(path, root).await {
             Ok((node, perm)) => {
                 let mut target = node.clone();
                 // An index-only node has no permission of its own; its
@@ -377,11 +412,34 @@ impl AccessPaths {
                 }
                 AccessPaths::new(perm)
             }
+        })
+    }
+
+    fn intersect(&mut self, other: &Self, inherited: AccessPerm, other_inherited: AccessPerm) {
+        let perm = if self.perm.indexonly() {
+            inherited
+        } else {
+            self.perm
         };
-        if !is_readonly_method(method) && !target.perm().readwrite() {
-            return None;
+        let other_perm = if other.perm.indexonly() {
+            other_inherited
+        } else {
+            other.perm
+        };
+        self.perm = std::cmp::min(perm, other_perm);
+        for name in other.children.keys() {
+            self.children
+                .entry(name.clone())
+                .or_insert_with(|| Self::new(perm));
         }
-        Some(target)
+        let default_other = Self::new(other_perm);
+        for (name, child) in &mut self.children {
+            child.intersect(
+                other.children.get(name).unwrap_or(&default_other),
+                perm,
+                other_perm,
+            );
+        }
     }
 
     fn add(&mut self, path: &str, perm: AccessPerm) {
@@ -482,6 +540,24 @@ impl AccessPaths {
         prefix: &[&str],
         root: Option<&Path>,
     ) -> EntryAccess {
+        if let (Some(policy), Some(root)) = (&self.policy, root) {
+            let path = if prefix.is_empty() {
+                path.to_string()
+            } else {
+                format!("{}/{}", prefix.join("/"), path)
+            };
+            return match policy.guard(&path, &Method::GET, Some(root)).await {
+                Some(node) => EntryAccess {
+                    perm: node.perm,
+                    restricted: node.perm.readwrite()
+                        && node.has_stricter_descendant(AccessPerm::ReadWrite),
+                },
+                None => EntryAccess {
+                    perm: AccessPerm::IndexOnly,
+                    restricted: false,
+                },
+            };
+        }
         // Without configured children every entry inherits this node's
         // permission, so the common no-auth case needs no per-entry lookup.
         if self.children.is_empty() {
@@ -791,7 +867,9 @@ fn check_digest_auth(
     let ha = format!("{:x}", ha.finalize());
 
     let qop = *digest_map.get(b"qop".as_ref())?;
-    if qop != b"auth" && qop != b"auth-int" {
+    // Only `auth` is advertised. `auth-int` additionally requires an entity
+    // digest, which this request verification does not calculate.
+    if qop != b"auth" {
         return Some(AuthResult::Invalid);
     }
     // `nc` and `cnonce` are mandatory for qop=auth (RFC 7616 §3.4.1) and are
@@ -849,30 +927,36 @@ fn record_nonce_count(nonce: &str, user: &str, nc: &[u8]) -> bool {
     };
 
     let now = unix_now().as_secs();
-    let expires = now.saturating_add(DIGEST_AUTH_TIMEOUT as u64);
     let mut nonce_counts = NONCE_COUNTS.lock().unwrap();
+    record_nonce_count_in(&mut nonce_counts, nonce, user, nc, now)
+}
+
+fn record_nonce_count_in(
+    nonce_counts: &mut NonceCounts,
+    nonce: &str,
+    user: &str,
+    nc: u32,
+    now: u64,
+) -> bool {
+    let expires = now.saturating_add(DIGEST_AUTH_TIMEOUT as u64);
+    let key = (nonce.to_string(), user.to_string());
+    if let Some((count, _)) = nonce_counts.get_mut(&key) {
+        if nc <= *count {
+            return false;
+        }
+        *count = nc;
+        return true;
+    }
     if nonce_counts.len() >= MAX_NONCE_COUNTS {
         nonce_counts.retain(|_, (_, expires)| *expires > now);
-        // `retain` cannot make room if every tracked nonce is still fresh;
-        // dropping all state is preferable to unbounded memory growth.
+        // Keep fresh replay records when full. Reject only new identities;
+        // existing identities can still advance their counts above.
         if nonce_counts.len() >= MAX_NONCE_COUNTS {
-            nonce_counts.clear();
+            return false;
         }
     }
-    let key = (nonce.to_string(), user.to_string());
-    match nonce_counts.get_mut(&key) {
-        Some((count, _)) => {
-            if nc <= *count {
-                return false;
-            }
-            *count = nc;
-            true
-        }
-        None => {
-            nonce_counts.insert(key, (nc, expires));
-            true
-        }
-    }
+    nonce_counts.insert(key, (nc, expires));
+    true
 }
 
 fn derive_secret_key(user: &str, pass: &str) -> SigningKey {
@@ -931,6 +1015,53 @@ async fn path_identity(root: &Path, prefix: &[&str], name: &str) -> Option<PathB
     }
     path.push(name);
     tokio::fs::canonicalize(path).await.ok()
+}
+
+/// Resolve the physical target of an existing or new entry below the root.
+/// Missing suffixes inherit the real parent's policy; dangling links also need
+/// their targets resolved because creating a file follows such a link.
+async fn canonical_relative_path(root: &Path, path: &str) -> Option<String> {
+    let real_root = tokio::fs::canonicalize(root).await.ok()?;
+    let mut pending = root.join(path.trim_matches('/'));
+    let mut missing = Vec::new();
+    let mut links = 0;
+    let mut real = loop {
+        match tokio::fs::canonicalize(&pending).await {
+            Ok(real) => break real,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(target) = tokio::fs::read_link(&pending).await {
+                    links += 1;
+                    if links > 40 {
+                        return None;
+                    }
+                    pending = if target.is_absolute() {
+                        target
+                    } else {
+                        pending.parent()?.join(target)
+                    };
+                } else {
+                    missing.push(pending.components().next_back()?.as_os_str().to_os_string());
+                    pending = pending.parent()?.to_path_buf();
+                }
+            }
+            Err(_) => return None,
+        }
+    };
+    for name in missing.into_iter().rev() {
+        if name == ".." {
+            real.pop();
+        } else if name != "." {
+            real.push(name);
+        }
+    }
+    Some(
+        real.strip_prefix(real_root)
+            .ok()?
+            .components()
+            .map(|v| v.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 /// Whether `name` could be a filesystem alias of the configured child `key`.
@@ -1378,6 +1509,17 @@ mod tests {
         uri: &str,
         nc: &str,
     ) -> HeaderValue {
+        digest_authorization_with_qop(user, pass, nonce, uri, nc, Some("auth"))
+    }
+
+    fn digest_authorization_with_qop(
+        user: &str,
+        pass: &str,
+        nonce: &str,
+        uri: &str,
+        nc: &str,
+        qop: Option<&str>,
+    ) -> HeaderValue {
         let mut ha1 = Context::new();
         ha1.consume(format!("{user}:{REALM}:{pass}").as_bytes());
         let ha1 = format!("{:x}", ha1.finalize());
@@ -1390,15 +1532,17 @@ mod tests {
         resp.consume(ha1.as_bytes());
         resp.consume(b":");
         resp.consume(nonce.as_bytes());
+        if let Some(qop) = qop {
+            resp.consume(format!(":{nc}:{cnonce}:{qop}"));
+        }
         resp.consume(b":");
-        resp.consume(nc.as_bytes());
-        resp.consume(b":");
-        resp.consume(cnonce.as_bytes());
-        resp.consume(b":auth:");
         resp.consume(ha2.as_bytes());
         let response = format!("{:x}", resp.finalize());
+        let qop_fields = qop
+            .map(|qop| format!(", qop={qop}, nc={nc}, cnonce=\"{cnonce}\""))
+            .unwrap_or_default();
         HeaderValue::from_str(&format!(
-            "Digest username=\"{user}\", realm=\"{REALM}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\", qop=auth, nc={nc}, cnonce=\"{cnonce}\""
+            "Digest username=\"{user}\", realm=\"{REALM}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\"{qop_fields}"
         ))
         .unwrap()
     }
@@ -1481,6 +1625,105 @@ mod tests {
         assert_eq!(
             check_auth(&bob, "GET", "/file.txt", "bob", "pass"),
             AuthResult::Valid
+        );
+    }
+
+    fn nonce_counts_at_capacity(expires: u64) -> NonceCounts {
+        (0..MAX_NONCE_COUNTS)
+            .map(|i| ((format!("nonce-{i}"), "user".to_string()), (1, expires)))
+            .collect()
+    }
+
+    #[test]
+    fn test_nonce_capacity_preserves_fresh_replay_records() {
+        let mut counts = nonce_counts_at_capacity(101);
+        assert!(!record_nonce_count_in(&mut counts, "new", "user", 1, 100));
+        assert_eq!(counts.len(), MAX_NONCE_COUNTS);
+        assert!(!record_nonce_count_in(
+            &mut counts,
+            "nonce-0",
+            "user",
+            1,
+            100
+        ));
+        assert!(record_nonce_count_in(
+            &mut counts,
+            "nonce-0",
+            "user",
+            2,
+            100
+        ));
+        assert!(!record_nonce_count_in(
+            &mut counts,
+            "nonce-0",
+            "user",
+            2,
+            100
+        ));
+        assert!(!record_nonce_count_in(
+            &mut counts,
+            "nonce-1",
+            "user",
+            1,
+            100
+        ));
+    }
+
+    #[test]
+    fn test_nonce_capacity_evicts_expired_records_only() {
+        let mut counts = nonce_counts_at_capacity(101);
+        counts.insert(("nonce-0".into(), "user".into()), (1, 100));
+        assert!(record_nonce_count_in(&mut counts, "new", "user", 1, 100));
+        assert_eq!(counts.len(), MAX_NONCE_COUNTS);
+        assert!(!counts.contains_key(&("nonce-0".into(), "user".into())));
+        assert!(!record_nonce_count_in(
+            &mut counts,
+            "nonce-1",
+            "user",
+            1,
+            100
+        ));
+        assert!(record_nonce_count_in(
+            &mut counts,
+            "nonce-1",
+            "user",
+            2,
+            100
+        ));
+    }
+
+    #[test]
+    fn test_digest_rejects_auth_int_without_recording_nonce_count() {
+        let user = "auth-int-user";
+        let nonce = nonce_with_offset(50);
+        let auth_int = digest_authorization_with_qop(
+            user,
+            "pass",
+            &nonce,
+            "/file.txt",
+            "00000001",
+            Some("auth-int"),
+        );
+        assert_eq!(
+            check_auth(&auth_int, "GET", "/file.txt", user, "pass"),
+            AuthResult::Invalid
+        );
+        let auth = digest_authorization(user, "pass", &nonce, "/file.txt", "00000001");
+        assert_eq!(
+            check_auth(&auth, "GET", "/file.txt", user, "pass"),
+            AuthResult::Valid
+        );
+    }
+
+    #[test]
+    fn test_digest_preserves_absent_qop_rejection() {
+        let user = "absent-qop-user";
+        let nonce = nonce_with_offset(60);
+        let auth =
+            digest_authorization_with_qop(user, "pass", &nonce, "/file.txt", "00000001", None);
+        assert_eq!(
+            check_auth(&auth, "GET", "/file.txt", user, "pass"),
+            AuthResult::Invalid
         );
     }
 

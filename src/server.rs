@@ -27,7 +27,7 @@ use hyper::{
     body::Incoming,
     header::{
         HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, LOCATION, RANGE,
+        CONTENT_TYPE, HOST, LOCATION, ORIGIN, RANGE, REFERER,
     },
     Method, StatusCode, Uri,
 };
@@ -146,6 +146,64 @@ impl Server {
             add_cors(&mut res);
         }
         Ok(res)
+    }
+
+    fn form_origin_allowed(&self, headers: &HeaderMap, request_uri: &Uri) -> bool {
+        // Browsers can submit simple forms with cached HTTP credentials. CORS
+        // response headers do not prevent the mutation. Native clients without
+        // browser origin metadata retain the existing POST API.
+        let (source, origin_only) = if let Some(origin) = headers.get(ORIGIN) {
+            if headers.get_all(ORIGIN).iter().count() != 1 {
+                return false;
+            }
+            (origin, true)
+        } else if let Some(referer) = headers.get(REFERER) {
+            if headers.get_all(REFERER).iter().count() != 1 {
+                return false;
+            }
+            (referer, false)
+        } else {
+            return true;
+        };
+        let Some(source) = source
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<Uri>().ok())
+        else {
+            return false;
+        };
+        let scheme = if self.args.tls_cert.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        if source.scheme_str() != Some(scheme)
+            || (origin_only && (source.path() != "/" || source.query().is_some()))
+        {
+            return false;
+        }
+        let Some(source_authority) = source.authority() else {
+            return false;
+        };
+        if source_authority.as_str().contains('@') {
+            return false;
+        }
+        let authority = match headers.get(HOST) {
+            Some(host) => host
+                .to_str()
+                .ok()
+                .and_then(|host| host.parse::<hyper::http::uri::Authority>().ok()),
+            None => request_uri.authority().cloned(),
+        };
+        let Some(authority) = authority else {
+            return false;
+        };
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        source_authority
+            .host()
+            .eq_ignore_ascii_case(authority.host())
+            && source_authority.port_u16().unwrap_or(default_port)
+                == authority.port_u16().unwrap_or(default_port)
     }
 
     pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
@@ -496,7 +554,7 @@ impl Server {
             }
             Method::POST => {
                 // no-JS forms post to a directory listing URL
-                if !is_dir {
+                if !is_dir || !self.form_origin_allowed(headers, req.uri()) {
                     DufsErrorCode::Forbidden.respond(&mut res);
                 } else {
                     let redirect_to = match req.uri().query() {
@@ -1317,7 +1375,7 @@ impl Server {
                     }
 
                     let stream_body = StreamBody::new(
-                        LengthLimitedStream::new(file, range_size as usize)
+                        LengthLimitedStream::new(file, range_size)
                             .map_ok(Frame::data)
                             .map_err(|err| anyhow!("{err}")),
                     );
@@ -1331,15 +1389,15 @@ impl Server {
 
                     // Compute the exact length up front, so a HEAD request (and
                     // the Content-Length header) never has to read the file.
-                    let mut content_length = footer.len();
+                    let mut content_length = footer.len() as u64;
                     for (start, end) in &ranges {
                         let range_size = end - start + 1;
                         let part_header = format!(
                             "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{size}\r\n\r\n",
                         );
                         content_length = content_length
-                            .saturating_add(part_header.len())
-                            .saturating_add(usize::try_from(range_size).unwrap_or(usize::MAX))
+                            .saturating_add(part_header.len() as u64)
+                            .saturating_add(range_size)
                             .saturating_add(2);
                     }
 
@@ -2425,12 +2483,13 @@ fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> 
             }
         })
         .collect();
+    let quoted_filename = filename.replace('\\', "\\\\").replace('"', "\\\"");
     let value = if filename.is_ascii() {
-        HeaderValue::from_str(&format!("{kind}; filename=\"{filename}\"",))?
+        HeaderValue::from_str(&format!("{kind}; filename=\"{quoted_filename}\"",))?
     } else {
         HeaderValue::from_str(&format!(
             "{kind}; filename=\"{}\"; filename*=UTF-8''{}",
-            filename,
+            quoted_filename,
             encode_uri(&filename),
         ))?
     };
@@ -2540,6 +2599,15 @@ where
     F: Fn(&DirEntry) -> bool,
 {
     let mut paths: Vec<PathBuf> = vec![];
+    let prefix: Vec<&str> = path
+        .strip_prefix(&serve_path)
+        .unwrap_or(Path::new(""))
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
     for dir in access_paths.entry_paths(&path) {
         let mut it = WalkDir::new(&dir).follow_links(true).into_iter();
         it.next();
@@ -2576,7 +2644,20 @@ where
                 }
                 continue;
             }
-            if !include_entry(&entry) {
+            let relative = match entry_path.strip_prefix(&path) {
+                Ok(relative) => relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                Err(_) => continue,
+            };
+            let access = access_paths
+                .entry_access(&relative, &prefix, Some(&serve_path))
+                .await;
+            // Keep walking index-only directories: they can contain readable
+            // descendants, but must not contribute inaccessible entries.
+            if access.perm.indexonly() || !include_entry(&entry) {
                 continue;
             }
             paths.push(entry_path.to_path_buf());

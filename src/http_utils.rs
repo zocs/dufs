@@ -41,14 +41,14 @@ pin_project_lite::pin_project! {
     pub struct LengthLimitedStream<R> {
         #[pin]
         reader: Option<R>,
-        remaining: usize,
+        remaining: u64,
         buf: BytesMut,
         capacity: usize,
     }
 }
 
 impl<R> LengthLimitedStream<R> {
-    pub fn new(reader: R, limit: usize) -> Self {
+    pub fn new(reader: R, limit: u64) -> Self {
         Self {
             reader: Some(reader),
             remaining: limit,
@@ -89,9 +89,9 @@ impl<R: AsyncRead> Stream for LengthLimitedStream<R> {
             }
             Poll::Ready(Ok(_)) => {
                 let mut chunk = this.buf.split();
-                let chunk_size = (*this.remaining).min(chunk.len());
+                let chunk_size = (*this.remaining).min(chunk.len() as u64) as usize;
                 chunk.truncate(chunk_size);
-                *this.remaining -= chunk_size;
+                *this.remaining -= chunk_size as u64;
                 Poll::Ready(Some(Ok(chunk.freeze())))
             }
         }
@@ -102,4 +102,29 @@ pub fn body_full(content: impl Into<hyper::body::Bytes>) -> BoxBody<Bytes, anyho
     Full::new(content.into())
         .map_err(anyhow::Error::new)
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn virtual_range_larger_than_four_gib_keeps_a_64_bit_remaining_count() {
+        let limit = u32::MAX as u64 + 65_536;
+        let mut stream = LengthLimitedStream::new(tokio::io::repeat(b'x'), limit);
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert!(!chunk.is_empty() && chunk.len() <= 4096);
+        assert_eq!(stream.remaining, limit - chunk.len() as u64);
+        assert!(stream.remaining > u32::MAX as u64);
+        // Only one bounded chunk is read from the virtual source.
+    }
+
+    #[tokio::test]
+    async fn a_limited_range_yields_only_its_requested_bytes() {
+        let mut stream = LengthLimitedStream::new(&b"0123456789"[..], 3);
+        assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"012");
+        assert!(stream.next().await.is_none());
+        assert!(stream.reader.is_none());
+    }
 }

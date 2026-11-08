@@ -5,6 +5,71 @@ use fixtures::{server, Error, TestServer};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rstest::rstest;
 
+#[cfg(unix)]
+#[rstest]
+fn sparse_ranges_above_four_gib_keep_exact_headers_and_stream_small_tails(
+    server: TestServer,
+) -> Result<(), Error> {
+    use std::io::{Seek, SeekFrom, Write};
+    let size = u32::MAX as u64 + 65_536;
+    let path = server.path().join("large-sparse.bin");
+    let mut file = std::fs::File::create(path)?;
+    file.set_len(size)?;
+    file.seek(SeekFrom::Start(size - 4))?;
+    file.write_all(b"tail")?;
+    let url = format!("{}large-sparse.bin", server.url());
+
+    let response = fetch!(b"HEAD", &url)
+        .header("range", format!("bytes=0-{}", size - 1))
+        .send()?;
+    assert_eq!(response.status(), 206);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()?
+            .parse::<u64>()?,
+        size
+    );
+
+    let range = format!("bytes=0-{},1-2", size - 1);
+    let response = fetch!(b"HEAD", &url).header("range", range).send()?;
+    assert_eq!(response.status(), 206);
+    let boundary = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()?
+        .split("boundary=")
+        .nth(1)
+        .unwrap();
+    let header1 = format!("--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-{}/{size}\r\n\r\n", size - 1);
+    let header2 = format!("--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 1-2/{size}\r\n\r\n");
+    let expected = size
+        + 2
+        + header1.len() as u64
+        + header2.len() as u64
+        + 4
+        + format!("--{boundary}--\r\n").len() as u64;
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()?
+            .parse::<u64>()?,
+        expected
+    );
+
+    let response = fetch!(b"GET", &url)
+        .header("range", format!("bytes={}-{}", size - 4, size - 1))
+        .send()?;
+    assert_eq!(response.status(), 206);
+    assert_eq!(response.bytes()?.as_ref(), b"tail");
+    Ok(())
+}
+
 #[rstest]
 fn get_file_range(server: TestServer) -> Result<(), Error> {
     let resp = fetch!(b"GET", format!("{}index.html", server.url()))

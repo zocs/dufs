@@ -306,6 +306,67 @@ fn get_file_emoji_path(server: TestServer) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[rstest]
+#[case::quote(r#"a"b.txt"#, r#"inline; filename="a\"b.txt""#)]
+#[case::backslash(r"a\b.txt", r#"inline; filename="a\\b.txt""#)]
+#[case::utf8(
+    r#"世界"\.txt"#,
+    r#"inline; filename="世界\"\\.txt"; filename*=UTF-8''%E4%B8%96%E7%95%8C%22%5C.txt"#
+)]
+fn file_content_disposition_preserves_quoted_filenames(
+    server: TestServer,
+    #[case] filename: &str,
+    #[case] expected: &str,
+) -> Result<(), Error> {
+    std::fs::write(server.path().join(filename), b"file contents")?;
+    let url = format!("{}{}", server.url(), utils::encode_uri(filename));
+    for method in ["GET", "HEAD"] {
+        let response = reqwest::blocking::Client::new()
+            .request(reqwest::Method::from_bytes(method.as_bytes())?, &url)
+            .send()?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-disposition")
+                .unwrap()
+                .as_bytes(),
+            expected.as_bytes(),
+            "{method} filename {filename:?} must use HTTP quoted-pair escaping"
+        );
+        assert_eq!(
+            response.bytes()?.as_ref(),
+            if method == "GET" {
+                &b"file contents"[..]
+            } else {
+                b""
+            }
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn archive_content_disposition_preserves_quoted_utf8_filename(
+    #[with(&["--allow-archive"])] server: TestServer,
+) -> Result<(), Error> {
+    let directory = r#"世界"\dir"#;
+    std::fs::create_dir(server.path().join(directory))?;
+    let response = reqwest::blocking::get(format!(
+        "{}{}?zip",
+        server.url(),
+        utils::encode_uri(directory)
+    ))?;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-disposition").unwrap().as_bytes(),
+        r#"attachment; filename="世界\"\\dir.zip"; filename*=UTF-8''%E4%B8%96%E7%95%8C%22%5Cdir.zip"#.as_bytes()
+    );
+    Ok(())
+}
+
 #[cfg(not(target_os = "windows"))]
 #[rstest]
 fn get_file_newline_path(server: TestServer) -> Result<(), Error> {

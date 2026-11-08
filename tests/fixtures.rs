@@ -160,8 +160,7 @@ pub fn port() -> Port {
     Port::reserve()
 }
 
-/// Run dufs as a server; Start with a temporary directory, a free port and some
-/// optional arguments then wait for a while for the server setup to complete.
+/// Run dufs and wait for its own startup output and a reachable socket.
 #[fixture]
 #[allow(dead_code)]
 pub fn server<I>(#[default(&[] as &[&str])] args: I) -> TestServer
@@ -169,22 +168,88 @@ where
     I: IntoIterator + Clone,
     I::Item: AsRef<std::ffi::OsStr>,
 {
+    server_on_port(args, port())
+}
+
+/// Start the fixture with an initial candidate port.
+#[allow(dead_code)]
+pub fn server_on_port<I>(args: I, port: Port) -> TestServer
+where
+    I: IntoIterator + Clone,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
     let tmpdir = tmpdir();
-    let port = port();
-    let child = Command::new(assert_cmd::cargo::cargo_bin!())
-        .arg(tmpdir.path())
-        .arg("-p")
-        .arg(port.to_string())
-        .args(args.clone())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("Couldn't run test binary");
     let is_tls = args
+        .clone()
         .into_iter()
         .any(|x| x.as_ref().to_str().unwrap().contains("tls"));
-
-    wait_for_port(&port);
-    TestServer::new(port, tmpdir, child, is_tls)
+    let mut candidate = Some(port);
+    let started = Instant::now();
+    let mut failures = Vec::new();
+    for _ in 0..10 {
+        let port = candidate.take().unwrap_or_else(Port::reserve);
+        // A separate directory keeps startup diagnostics out of the served
+        // fixture. File-backed output avoids blocking reader threads or a
+        // full pipe when later requests produce logs.
+        let output = TempDir::new().expect("Couldn't create startup output directory");
+        let output_path = output.path().join("output.log");
+        let log = std::fs::File::create(&output_path).unwrap();
+        let mut child = Command::new(assert_cmd::cargo::cargo_bin!())
+            .arg(tmpdir.path())
+            .arg("-p")
+            .arg(port.to_string())
+            .args(args.clone())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("Couldn't run test binary");
+        loop {
+            let diagnostics = std::fs::read_to_string(&output_path).unwrap();
+            if let Some(status) = child.try_wait().expect("Couldn't check test server status") {
+                let diagnostics = std::fs::read_to_string(&output_path).unwrap();
+                failures.push(format!(
+                    "Test server on port {port} exited {status}:\n{diagnostics}"
+                ));
+                // The in-process reservation cannot prevent another process
+                // or an outgoing ephemeral socket from claiming this port.
+                if diagnostics.contains("Failed to bind")
+                    && started.elapsed() < Duration::from_secs(10)
+                {
+                    break;
+                }
+                panic!("{}", failures.join("\n"));
+            }
+            // A socket alone may belong to the process that beat this child
+            // to the port. dufs prints this only after all listeners bind.
+            let announced = diagnostics
+                .lines()
+                .any(|line| line.starts_with("Listening on"));
+            if announced
+                && port_check::is_port_reachable_with_timeout(
+                    format!("localhost:{port}"),
+                    Duration::from_millis(100),
+                )
+            {
+                let mut server = TestServer::new(port, tmpdir, child, is_tls);
+                server.startup_output = Some(output);
+                return server;
+            }
+            if started.elapsed() >= Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let diagnostics = std::fs::read_to_string(&output_path).unwrap();
+                panic!(
+                    "Timeout waiting for test server on port {port}:\n{diagnostics}\n{}",
+                    failures.join("\n")
+                );
+            }
+            sleep(Duration::from_millis(10));
+        }
+    }
+    panic!(
+        "Test server could not bind after ten attempts:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// Whether the host can actually use IPv6.
@@ -194,6 +259,7 @@ pub fn is_ipv6_available() -> bool {
 }
 
 /// Wait a max of 2s for the server on `port` to become reachable.
+#[allow(dead_code)]
 pub fn wait_for_port(port: &Port) {
     let start_wait = Instant::now();
 
@@ -212,6 +278,7 @@ pub struct TestServer {
     tmpdir: TempDir,
     child: Child,
     is_tls: bool,
+    startup_output: Option<TempDir>,
 }
 
 #[allow(dead_code)]
@@ -222,6 +289,7 @@ impl TestServer {
             tmpdir,
             child,
             is_tls,
+            startup_output: None,
         }
     }
 

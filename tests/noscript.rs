@@ -14,6 +14,102 @@ fn client() -> reqwest::blocking::Client {
 }
 
 #[rstest]
+#[case::mkdir("mkdir")]
+#[case::delete("delete")]
+#[case::upload("upload")]
+fn form_posts_reject_untrusted_origin(
+    #[with(&["-A", "--auth", "user:pass@/:rw", "--enable-cors"])] server: TestServer,
+    #[case] action: &str,
+) -> Result<(), Error> {
+    let same_origin = server.url().as_str().trim_end_matches('/').to_string();
+    let origins = [
+        "http://example.invalid".to_string(),
+        "http://127.0.0.1:1".to_string(),
+        same_origin.replacen("http:", "https:", 1),
+        "null".to_string(),
+        format!("{same_origin}/unexpected/path"),
+    ];
+    for origin in origins {
+        let request = client()
+            .post(format!("{}?noscript", server.url()))
+            .basic_auth("user", Some("pass"))
+            .header("origin", origin);
+        let request = match action {
+            "mkdir" => request
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body("mkdir=1&name=newdir"),
+            "delete" => request
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body("delete=1&name=test.txt"),
+            _ => request.multipart(Form::new().part(
+                "file",
+                Part::bytes(b"uploaded".to_vec()).file_name("upload.txt"),
+            )),
+        };
+        assert_eq!(request.send()?.status(), 403);
+        assert!(server.path().join("test.txt").is_file());
+        assert!(!server.path().join("newdir").exists());
+        assert!(!server.path().join("upload.txt").exists());
+    }
+    Ok(())
+}
+
+#[rstest]
+fn form_post_rejects_duplicate_origin(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let origin = server.url().as_str().trim_end_matches('/').to_string();
+    let response = client()
+        .post(format!("{}?noscript", server.url()))
+        .header("origin", &origin)
+        .header("origin", &origin)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("mkdir=1&name=newdir")
+        .send()?;
+    assert_eq!(response.status(), 403);
+    assert!(!server.path().join("newdir").exists());
+    Ok(())
+}
+
+#[rstest]
+fn form_post_accepts_same_origin(
+    #[with(&["-A", "--auth", "user:pass@/:rw"])] server: TestServer,
+) -> Result<(), Error> {
+    let origin = server.url().as_str().trim_end_matches('/').to_string();
+    let response = client()
+        .post(format!("{}?noscript", server.url()))
+        .basic_auth("user", Some("pass"))
+        .header("origin", origin)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("mkdir=1&name=newdir")
+        .send()?;
+    assert_eq!(response.status(), 303);
+    assert!(server.path().join("newdir").is_dir());
+    Ok(())
+}
+
+#[rstest]
+fn form_posts_validate_referer_when_origin_is_absent(
+    #[with(&["-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let response = client()
+        .post(format!("{}?noscript", server.url()))
+        .header("referer", "http://example.invalid/page")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("mkdir=1&name=rejected")
+        .send()?;
+    assert_eq!(response.status(), 403);
+    assert!(!server.path().join("rejected").exists());
+    let response = client()
+        .post(format!("{}?noscript", server.url()))
+        .header("referer", format!("{}?noscript", server.url()))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("mkdir=1&name=accepted")
+        .send()?;
+    assert_eq!(response.status(), 303);
+    assert!(server.path().join("accepted").is_dir());
+    Ok(())
+}
+
+#[rstest]
 fn noscript_page_has_forms(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     let text = reqwest::blocking::get(format!("{}?noscript", server.url()))?.text()?;
     assert!(text.contains("Upload"));

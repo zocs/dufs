@@ -800,7 +800,7 @@ async function setupEditorPage() {
       $saveBtn.addEventListener("click", saveChange);
     }
   } else if (DATA.kind == "View") {
-    $editor.readonly = true;
+    $editor.readOnly = true;
   }
 
   if (!DATA.editable) {
@@ -817,7 +817,7 @@ async function setupEditorPage() {
   }
 
   $editor.classList.remove("hidden");
-  $editor.readonly = DATA.kind == "View" || !DATA.allow_upload;
+  $editor.readOnly = DATA.kind == "View" || !DATA.allow_upload;
   try {
     const res = await fetch(baseUrl());
     await assertResOK(res);
@@ -938,13 +938,15 @@ async function doMovePath(fileUrl) {
  */
 async function saveChange() {
   try {
-    await fetch(baseUrl(), {
+    const res = await fetch(baseUrl(), {
       method: "PUT",
       body: $editor.value,
     });
+    await assertResOK(res);
     location.reload();
   } catch (err) {
     alert(`Failed to save file, ${err.message}`);
+    $editor.focus();
   }
 }
 

@@ -64,3 +64,17 @@ jobs:
       run: |
         cargo test --locked --all --no-default-features
         cargo clippy --locked --all --all-targets --no-default-features
+
+    - name: Install browser test runtime
+      if: runner.os == 'Linux'
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - name: Verify editor in Chromium and ES2017 compatibility
+      if: runner.os == 'Linux'
+      run: |
+        cargo build --locked --bin dufs
+        npm ci --prefix tests/browser
+        npm run check:es2017 --prefix tests/browser
+        npm test --prefix tests/browser
