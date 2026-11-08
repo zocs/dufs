@@ -139,7 +139,9 @@ if (document.readyState === "loading") {
     once: true,
   });
 } else {
-  queueMicrotask(initialize);
+  // queueMicrotask() needs Chromium 71+; a resolved promise schedules the
+  // same microtask on Chromium 55 (ES2015 Promise).
+  Promise.resolve().then(initialize);
 }
 
 async function ready() {
@@ -525,11 +527,13 @@ function renderPathsTableBody() {
     }
     // Show an action column when it is available for the current directory or
     // at least one entry. Rows without permission render the action disabled.
+    // Plain `p && p.x` guards instead of optional chaining (Chromium 80+);
+    // entries are nulled out by deletePath(), so keep the null check.
     const showMove =
       (DATA.allow_upload && DATA.allow_delete) ||
-      DATA.paths.some((p) => p?.allow_upload && p?.allow_delete);
+      DATA.paths.some((p) => p && p.allow_upload && p.allow_delete);
     const showDelete =
-      DATA.allow_delete || DATA.paths.some((p) => p?.allow_delete);
+      DATA.allow_delete || DATA.paths.some((p) => p && p.allow_delete);
     for (let i = 0; i < len; i++) {
       addPath(DATA.paths[i], i, showMove, showDelete);
     }
