@@ -278,6 +278,7 @@ async fn handle_stream<T>(
         service_fn(move |request: Request<Incoming>| handle.clone().call(request, addr));
 
     let _ = Builder::new(TokioExecutor::new())
+        .title_case_headers(true) // parity with the bin (upstream #751)
         .serve_connection_with_upgrades(stream, hyper_service)
         .await;
 }
@@ -293,6 +294,9 @@ fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
         if addr.is_ipv6() {
             socket.set_only_v6(true)?;
         }
+        // upstream #762: on Windows SO_REUSEADDR lets a second socket bind a
+        // port that is in use (start "succeeds" but never gets connections).
+        #[cfg(not(windows))]
         socket.set_reuse_address(true)?;
         // On non-Windows, also set SO_REUSEPORT for faster rebinding
         #[cfg(unix)]
