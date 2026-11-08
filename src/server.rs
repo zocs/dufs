@@ -491,7 +491,7 @@ impl Server {
                         Some(q) if !q.is_empty() => format!("{}?{}", req.uri().path(), q),
                         _ => format!("{}?noscript", req.uri().path()),
                     };
-                    self.handle_post_dir(path, &redirect_to, req, &mut res)
+                    self.handle_post_dir(path, &access_paths, &redirect_to, req, &mut res)
                         .await?;
                 }
             }
@@ -646,6 +646,7 @@ impl Server {
     async fn handle_post_dir(
         &self,
         dir_path: &Path,
+        access_paths: &AccessPaths,
         redirect_to: &str,
         req: Request,
         res: &mut Response,
@@ -658,7 +659,7 @@ impl Server {
 
         if content_type.starts_with("multipart/form-data") {
             return self
-                .handle_upload_form(dir_path, redirect_to, req, res)
+                .handle_upload_form(dir_path, access_paths, redirect_to, req, res)
                 .await;
         }
 
@@ -679,6 +680,11 @@ impl Server {
                 Some(name) => {
                     let target = dir_path.join(&name);
                     if self.guard_root_contained(&target).await {
+                        DufsErrorCode::Forbidden.respond(res);
+                        return Ok(());
+                    }
+                    let access = self.post_entry_access(access_paths, dir_path, &name).await;
+                    if !access.perm.readwrite() {
                         DufsErrorCode::Forbidden.respond(res);
                         return Ok(());
                     }
@@ -704,8 +710,19 @@ impl Server {
                         DufsErrorCode::Forbidden.respond(res);
                         return Ok(());
                     }
+                    let access = self.post_entry_access(access_paths, dir_path, &name).await;
+                    if !access.perm.readwrite() {
+                        DufsErrorCode::Forbidden.respond(res);
+                        return Ok(());
+                    }
                     match fs::metadata(&target).await {
                         Ok(meta) => {
+                            // upstream #770: never remove_dir_all a subtree
+                            // that holds a stricter (read-only) rule
+                            if meta.is_dir() && access.restricted {
+                                DufsErrorCode::ReadonlyDescendant.respond(res);
+                                return Ok(());
+                            }
                             // delete directly instead of calling
                             // handle_delete (which sets 204) so we can
                             // return 303 redirect instead
@@ -733,6 +750,7 @@ impl Server {
     async fn handle_upload_form(
         &self,
         dir_path: &Path,
+        access_paths: &AccessPaths,
         redirect_to: &str,
         req: Request,
         res: &mut Response,
@@ -773,6 +791,23 @@ impl Server {
                 DufsErrorCode::Forbidden.respond(res);
                 return Ok(());
             }
+            let access = self.post_entry_access(access_paths, dir_path, &name).await;
+            if !access.perm.readwrite() {
+                DufsErrorCode::Forbidden.respond(res);
+                return Ok(());
+            }
+            // Same overwrite rule as PUT: a directory is never replaced, and
+            // replacing a non-empty file needs --allow-delete.
+            if let Ok(meta) = fs::metadata(&target).await {
+                if meta.is_dir() {
+                    DufsErrorCode::IsADirectory.respond(res);
+                    return Ok(());
+                }
+                if meta.len() > 0 && !self.args.allow_delete {
+                    DufsErrorCode::DeleteDisabled.respond(res);
+                    return Ok(());
+                }
+            }
             if let Err(_) = save_upload_field(&target, field).await {
                 let _ = tokio::fs::remove_file(&target).await;
                 status_bad_request(res, "Write Failed");
@@ -786,6 +821,21 @@ impl Server {
         }
         status_redirect(res, redirect_to);
         Ok(())
+    }
+
+    /// Effective permission of `name` directly below the POSTed directory,
+    /// resolved against the guarded rule subtree exactly like the listing
+    /// (#772) and direct PUT/DELETE/MKCOL requests to that child (#770).
+    async fn post_entry_access(
+        &self,
+        access_paths: &AccessPaths,
+        dir_path: &Path,
+        name: &str,
+    ) -> EntryAccess {
+        let prefix = self.relative_parts(dir_path);
+        access_paths
+            .entry_access(name, &prefix, Some(&self.args.serve_path))
+            .await
     }
 
     async fn handle_ls_dir(

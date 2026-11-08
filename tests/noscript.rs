@@ -214,3 +214,49 @@ fn post_empty_form(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 400);
     Ok(())
 }
+
+#[rstest]
+fn upload_overwrite_needs_delete(#[with(&["--allow-upload"])] server: TestServer) -> Result<(), Error> {
+    let form = Form::new().part("file", Part::bytes(b"new".to_vec()).file_name("test.txt"));
+    let resp = client()
+        .post(format!("{}?noscript", server.url()))
+        .multipart(form)
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.headers().get("x-dufs-error-code").unwrap(), "delete-disabled");
+    assert_eq!(
+        std::fs::read_to_string(server.path().join("test.txt"))?,
+        "This is test.txt"
+    );
+    Ok(())
+}
+
+#[rstest]
+fn delete_respects_readonly_child(
+    #[with(&["--auth", "user:pass@/:rw,/dir1:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = client()
+        .post(format!("{}?noscript", server.url()))
+        .basic_auth("user", Some("pass"))
+        .body("delete=1&name=dir1")
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert!(server.path().join("dir1/test.txt").exists());
+    Ok(())
+}
+
+#[rstest]
+fn delete_dir_with_readonly_descendant(
+    #[with(&["--auth", "user:pass@/:rw,/dir1/sub:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("dir1/sub"))?;
+    let resp = client()
+        .post(format!("{}?noscript", server.url()))
+        .basic_auth("user", Some("pass"))
+        .body("delete=1&name=dir1")
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.headers().get("x-dufs-error-code").unwrap(), "readonly-descendant");
+    assert!(server.path().join("dir1/sub").exists());
+    Ok(())
+}

@@ -93,7 +93,11 @@ fn render_path_item(path: &PathItem, allow_delete: bool) -> String {
     };
     let mtime = format_mtime(path.mtime).unwrap_or_default();
     let size = format_size(path.size, path.path_type);
-    let delete = if allow_delete {
+    let delete = if allow_delete && !path.allow_delete {
+        // column shown for the directory, but this entry is read-only (or a
+        // directory holding read-only entries, upstream #770/#772)
+        "<td></td>".to_string()
+    } else if allow_delete {
         format!(
             r#"<td><form class="inline" method="POST" action="">
   <input type="hidden" name="delete" value="1">
