@@ -8,7 +8,9 @@ fn occupied_candidate_port_is_retried_without_attaching_to_another_listener() {
     let candidate = port();
     let listener = TcpListener::bind(format!("127.0.0.1:{candidate}")).unwrap();
     let occupied = listener.local_addr().unwrap().port();
-    let server = server_on_port(&[] as &[&str], candidate);
+    // Require the exact occupied address. Wildcard/default binds can coexist
+    // with a specific-address listener under platform-specific socket rules.
+    let server = server_on_port(&["--bind", "127.0.0.1"], candidate);
     assert_ne!(server.port(), occupied);
     let response = reqwest::blocking::get(server.url().join("test.txt").unwrap()).unwrap();
     assert_eq!(response.status(), 200);
