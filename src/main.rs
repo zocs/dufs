@@ -1,5 +1,6 @@
 mod args;
 mod auth;
+mod error;
 mod http_logger;
 mod http_utils;
 mod logger;
@@ -15,7 +16,7 @@ use crate::server::Server;
 #[cfg(feature = "tls")]
 use crate::utils::{load_certs, load_private_key};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use args::BindAddr;
 use clap_complete::Shell;
 use futures_util::future::join_all;
@@ -34,7 +35,10 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio::{net::TcpListener, task::JoinHandle};
 #[cfg(feature = "tls")]
-use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+use tokio_rustls::{
+    rustls::{crypto::ring, ServerConfig},
+    TlsAcceptor,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -88,9 +92,14 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                     (Some(cert_file), Some(key_file)) => {
                         let certs = load_certs(cert_file)?;
                         let key = load_private_key(key_file)?;
-                        let mut config = ServerConfig::builder()
-                            .with_no_client_auth()
-                            .with_single_cert(certs, key)?;
+                        // Select the `ring` provider explicitly instead of relying on
+                        // rustls' feature-based auto-detection, which panics when more
+                        // than one provider is enabled (e.g. via dev-dependencies).
+                        let mut config =
+                            ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                                .with_safe_default_protocol_versions()?
+                                .with_no_client_auth()
+                                .with_single_cert(certs, key)?;
                         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                         let config = Arc::new(config);
                         let tls_accepter = TlsAcceptor::from(config);
@@ -137,7 +146,7 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                         handles.push(handle);
                     }
                     _ => {
-                        unreachable!()
+                        bail!("tls-cert and tls-key must be set together")
                     }
                 };
             }
@@ -181,6 +190,7 @@ where
         service_fn(move |request: Request<Incoming>| handle.clone().call(request, addr));
 
     match Builder::new(TokioExecutor::new())
+        .title_case_headers(true)
         .serve_connection_with_upgrades(stream, hyper_service)
         .await
     {
@@ -199,6 +209,10 @@ fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
     }
+    // On Windows `SO_REUSEADDR` allows binding an address that is already in use,
+    // so a second instance would start successfully but never receive connections.
+    // Only set it elsewhere, where it just allows rebinding a port in `TIME_WAIT`.
+    #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024 /* Default backlog */)?;
@@ -240,10 +254,7 @@ fn check_addrs(args: &Args) -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
                 }
             },
             #[cfg(unix)]
-            _ => {
-                new_addrs.push(bind_addr.clone());
-                print_addrs.push(bind_addr.clone())
-            }
+            _ => print_addrs.push(bind_addr.clone()),
         }
     }
     print_addrs.sort_unstable();
@@ -303,7 +314,7 @@ fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler")
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        error!("Failed to install CTRL+C signal handler, {e}");
+    }
 }

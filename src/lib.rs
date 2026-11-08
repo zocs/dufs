@@ -9,6 +9,7 @@ pub(crate) use log::{debug, error, info, trace, warn};
 
 mod args;
 mod auth;
+mod error;
 mod http_logger;
 mod http_utils;
 mod logger;

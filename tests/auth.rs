@@ -2,7 +2,7 @@ mod digest_auth_util;
 mod fixtures;
 mod utils;
 
-use digest_auth_util::send_with_digest_auth;
+use digest_auth_util::{digest_authorization, send_with_digest_auth};
 use fixtures::{server, Error, TestServer};
 use indexmap::IndexSet;
 use rstest::rstest;
@@ -35,6 +35,43 @@ fn auth(#[case] server: TestServer, #[case] user: &str, #[case] pass: &str) -> R
     assert_eq!(resp.status(), 401);
     let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), user, pass)?;
     assert_eq!(resp.status(), 201);
+    Ok(())
+}
+
+#[rstest]
+fn auth_digest_replay(
+    #[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}file1", server.url());
+    let challenge = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
+    assert_eq!(challenge.status(), 401);
+    let authorization = digest_authorization(
+        fetch!(b"PUT", &url).body(b"abc".to_vec()),
+        &challenge,
+        "user",
+        "pass",
+    )?;
+
+    let resp = fetch!(b"PUT", &url)
+        .body(b"abc".to_vec())
+        .header("Authorization", &authorization)
+        .send()?;
+    assert_eq!(resp.status(), 201);
+
+    // Replaying the header on another path must not authenticate.
+    let other = format!("{}file2", server.url());
+    let resp = fetch!(b"PUT", &other)
+        .body(b"evil".to_vec())
+        .header("Authorization", &authorization)
+        .send()?;
+    assert_eq!(resp.status(), 401);
+
+    // Replaying it on the original path must be rejected as well.
+    let resp = fetch!(b"PUT", &url)
+        .body(b"abc".to_vec())
+        .header("Authorization", &authorization)
+        .send()?;
+    assert_eq!(resp.status(), 401);
     Ok(())
 }
 
@@ -365,11 +402,307 @@ fn auth_data(
     Ok(())
 }
 
+fn path_item<'a>(json: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    json["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("missing path item `{name}`: {json}"))
+}
+
+fn assert_item_access(
+    item: &serde_json::Value,
+    allow_upload: bool,
+    allow_delete: bool,
+    readonly_descendant: bool,
+) {
+    assert_eq!(
+        item["allow_upload"].as_bool(),
+        Some(allow_upload),
+        "unexpected allow_upload for {item}"
+    );
+    assert_eq!(
+        item["allow_delete"].as_bool(),
+        Some(allow_delete),
+        "unexpected allow_delete for {item}"
+    );
+    assert_eq!(
+        item["readonly_descendant"].as_bool(),
+        Some(readonly_descendant),
+        "unexpected readonly_descendant for {item}"
+    );
+}
+
+#[rstest]
+fn auth_pathitem_permissions(
+    #[with(&["--auth", "user:pass@/:rw,/dir1:ro,/dir2/sub:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}?json", server.url())),
+        "user",
+        "pass",
+    )?;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    // Explicitly read-only.
+    assert_item_access(path_item(&json, "dir1"), false, false, false);
+    // Writable, but a read-only descendant prevents recursive delete/move.
+    assert_item_access(path_item(&json, "dir2"), true, false, true);
+    // Fully writable.
+    assert_item_access(path_item(&json, "dir3"), true, true, false);
+    assert_item_access(path_item(&json, "test.txt"), true, true, false);
+
+    // Children of a read-only directory inherit its read-only permission.
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}dir1/?json", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_item_access(path_item(&json, "test.txt"), false, false, false);
+
+    // Search results use their nested path to resolve the same rules.
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}?q=test.html&json", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_item_access(path_item(&json, "dir1/test.html"), false, false, false);
+    assert_item_access(path_item(&json, "dir2/test.html"), true, true, false);
+    assert_item_access(path_item(&json, "dir3/test.html"), true, true, false);
+    Ok(())
+}
+
+#[rstest]
+fn auth_pathitem_permissions_under_readonly_parent(
+    #[with(&["--auth", "user:pass@/dir1:ro,/dir1/sub:rw", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("dir1/sub"))?;
+    std::fs::write(server.path().join("dir1/sub/keep.txt"), "keep")?;
+
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}dir1/?json", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    // The writable child rule overrides the read-only parent.
+    assert_item_access(path_item(&json, "sub"), true, true, false);
+    assert_item_access(path_item(&json, "test.txt"), false, false, false);
+
+    // The index-only root still exposes dir1, which itself is read-only.
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}?json", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_item_access(path_item(&json, "dir1"), false, false, false);
+
+    // Nested search results resolve the writable rule below the read-only one.
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}?q=keep&json", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_item_access(path_item(&json, "dir1/sub/keep.txt"), true, true, false);
+    Ok(())
+}
+
+#[rstest]
+fn auth_file_permissions(
+    #[with(&["--auth", "user:pass@/:rw,/dir1/test.txt:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}dir1/test.txt?json", server.url())),
+        "user",
+        "pass",
+    )?;
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_item_access(&json, false, false, false);
+
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}dir1/test.html?json", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_item_access(&json, true, true, false);
+
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}dir1/test.txt?edit", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json = utils::retrieve_json(&resp.text()?).unwrap();
+    assert_eq!(json["allow_upload"].as_bool(), Some(false));
+    assert_eq!(json["allow_delete"].as_bool(), Some(false));
+    Ok(())
+}
+
+#[rstest]
+fn auth_pathitem_respects_global_flags(
+    #[with(&["--auth", "user:pass@/:rw"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = send_with_digest_auth(
+        fetch!(b"GET", format!("{}dir1/?json", server.url())),
+        "user",
+        "pass",
+    )?;
+    let json: serde_json::Value = serde_json::from_str(&resp.text()?)?;
+    assert_item_access(path_item(&json, "test.txt"), false, false, false);
+    Ok(())
+}
+
 #[rstest]
 fn auth_precedence(
     #[with(&["--auth", "user:pass@/dir1:rw,/dir1/test.txt", "-A"])] server: TestServer,
 ) -> Result<(), Error> {
     let url = format!("{}dir1/test.txt", server.url());
+    let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+    assert_eq!(resp.status(), 403);
+
+    Ok(())
+}
+
+#[rstest]
+fn auth_alias_case_file(
+    #[with(&["--auth", "user:pass@/dir1:rw,/dir1/test.txt:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    if !utils::fs_folds_case(server.path()) {
+        return Ok(());
+    }
+
+    let url = format!("{}dir1/test.txt", server.url());
+    let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+    assert_eq!(resp.status(), 403);
+
+    let url = format!("{}dir1/TEST.TXT", server.url());
+    let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+    assert_eq!(resp.status(), 403);
+
+    let url = format!("{}dir1/test.txt", server.url());
+    let resp = fetch!(b"GET", &url)
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+
+    let url = format!("{}dir1/other.txt", server.url());
+    let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+    assert_eq!(resp.status(), 201);
+
+    Ok(())
+}
+
+#[rstest]
+fn auth_alias_case_directory(
+    #[with(&["--auth", "user:pass@/:rw,/Protected:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("Protected"))?;
+    std::fs::write(server.path().join("Protected/file.txt"), "TOP SECRET")?;
+
+    let url = format!("{}Protected/new.txt", server.url());
+    let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+    assert_eq!(resp.status(), 403);
+
+    if utils::fs_folds_case(server.path()) {
+        for alias in [
+            "protected/new.txt",
+            "PROTECTED/new.txt",
+            "pRoTeCtEd/new.txt",
+        ] {
+            let url = format!("{}{alias}", server.url());
+            let resp =
+                send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+            assert_eq!(resp.status(), 403, "alias `{alias}` was not guarded");
+        }
+        let url = format!("{}PROTECTED/file.txt", server.url());
+        let resp = send_with_digest_auth(fetch!(b"DELETE", &url), "user", "pass")?;
+        assert_eq!(resp.status(), 403);
+    } else {
+        let url = format!("{}protected/new.txt", server.url());
+        let resp =
+            send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+        assert_eq!(resp.status(), 201);
+    }
+
+    Ok(())
+}
+
+#[rstest]
+fn auth_alias_webdav_destination(
+    #[with(&["--auth", "user:pass@/:rw,/Protected:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    if !utils::fs_folds_case(server.path()) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(server.path().join("Protected"))?;
+
+    let origin_url = format!("{}test.txt", server.url());
+    let dest_url = format!("{}protected/moved.txt", server.url());
+
+    let resp = send_with_digest_auth(
+        fetch!(b"MOVE", &origin_url).header("Destination", &dest_url),
+        "user",
+        "pass",
+    )?;
+    assert_eq!(resp.status(), 403);
+
+    let resp = send_with_digest_auth(
+        fetch!(b"COPY", &origin_url).header("Destination", &dest_url),
+        "user",
+        "pass",
+    )?;
+    assert_eq!(resp.status(), 403);
+
+    Ok(())
+}
+
+/// On Windows an NTFS data stream suffix (`file.txt::$DATA`) names the same
+/// data as `file.txt`, and so must be authorized as it.
+///
+/// A trailing dot is *not* covered here: dufs canonicalizes the served path to
+/// a verbatim (`\\?\`) form, under which `file.txt.` is a distinct file rather
+/// than an alias of `file.txt` (matching the discovery report).
+#[cfg(windows)]
+#[rstest]
+fn auth_alias_windows_stream(
+    #[with(&["--auth", "user:pass@/dir1:rw,/dir1/test.txt:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    for alias in ["dir1/test.txt::$DATA", "dir1/TEST.TXT::$DATA"] {
+        let url = format!("{}{alias}", server.url());
+        let resp =
+            send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
+        assert_eq!(resp.status(), 403, "alias `{alias}` was not guarded");
+    }
+    let resp = fetch!(b"GET", format!("{}dir1/test.txt", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+/// On Windows a volume may also report an NTFS 8.3 short name for a long name;
+/// requests using it must be authorized as the configured long name.
+#[cfg(windows)]
+#[rstest]
+fn auth_alias_windows_short_name(
+    #[with(&["--auth", "user:pass@/:rw,/supersecretstorage:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let dir = server.path().join("supersecretstorage");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("file.txt"), "TOP SECRET")?;
+
+    let Some(short) = utils::short_name(&dir) else {
+        // 8.3 name generation is disabled for this volume
+        return Ok(());
+    };
+
+    let url = format!("{}{short}/new.txt", server.url());
     let resp = send_with_digest_auth(fetch!(b"PUT", &url).body(b"abc".to_vec()), "user", "pass")?;
     assert_eq!(resp.status(), 403);
 
@@ -403,5 +736,203 @@ fn token_auth(#[with(&["-a", "user:pass@/"])] server: TestServer) -> Result<(), 
     let url = format!("{}index.html?token={token}", server.url());
     let resp = fetch!(b"GET", &url).send()?;
     assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
+fn token_auth_cannot_renew(
+    #[with(&["-a", "user:pass@/"])] server: TestServer,
+) -> Result<(), Error> {
+    // A share token must not be able to mint another token, otherwise a
+    // short-lived link could be renewed forever.
+    let url = format!("{}index.html?tokengen", server.url());
+    let token = fetch!(b"GET", &url)
+        .basic_auth("user", Some("pass"))
+        .send()?
+        .text()?;
+
+    // The token is still accepted for a normal request.
+    let url = format!("{}index.html?token={token}", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 200);
+
+    // But it must not be able to renew itself.
+    let url = format!("{}index.html?token={token}&tokengen", server.url());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 401);
+
+    Ok(())
+}
+
+#[rstest]
+fn auth_digest_malformed_header(
+    #[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    for authorization in [
+        "Digest a=\"",
+        "Digest a==,",
+        "Digest a=",
+        "Digest =,\"",
+        "Digest a=\"b\",",
+        "Digest a=\"b\" , c",
+    ] {
+        let resp = fetch!(b"GET", server.url())
+            .header("Authorization", authorization)
+            .send()?;
+        assert_eq!(resp.status(), 401);
+    }
+
+    let url = format!("{}index.html", server.url());
+    let resp = fetch!(b"GET", &url)
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
+fn auth_digest_malformed_header_without_auth(
+    #[with(&[
+        "--log-format",
+        "$remote_addr $remote_user \"$request\" $status",
+    ])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let resp = fetch!(b"GET", server.url())
+        .header("Authorization", "Digest a=\"")
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
+fn token_auth_rejects(#[with(&["-a", "user:pass@/"])] server: TestServer) -> Result<(), Error> {
+    let url = format!("{}index.html?tokengen", server.url());
+
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 401);
+
+    let resp = fetch!(b"GET", &url)
+        .basic_auth("user", Some("wrong"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+
+    let resp = fetch!(b"OPTIONS", &url).send()?;
+    assert_eq!(resp.status(), 401);
+
+    let resp = fetch!(b"OPTIONS", &url)
+        .basic_auth("user", Some("wrong"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+
+    let resp = fetch!(b"OPTIONS", &url)
+        .basic_auth("no-such-user", Some("wrong"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+
+    Ok(())
+}
+
+fn error_code(resp: &reqwest::blocking::Response) -> Option<&str> {
+    resp.headers()
+        .get("x-dufs-error-code")
+        .and_then(|v| v.to_str().ok())
+}
+
+/// Deleting an ancestor recursively must not remove a `:ro` child that a
+/// direct request to that child is forbidden to touch.
+#[rstest]
+fn delete_ancestor_denied_with_restricted_child(
+    #[with(&["--auth", "user:pass@/:rw,/dir1:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = fetch!(b"DELETE", format!("{}dir1/test.txt", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(error_code(&resp), Some("forbidden"));
+
+    let resp = fetch!(b"DELETE", server.url())
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(error_code(&resp), Some("readonly-descendant"));
+    assert!(server.path().join("dir1/test.txt").exists());
+    assert!(server.path().join("test.txt").exists());
+    Ok(())
+}
+
+#[rstest]
+fn delete_ancestor_denied_with_restricted_nested_path(
+    #[with(&["--auth", "user:pass@/:rw,/dir1/sub:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("dir1/sub"))?;
+    std::fs::write(server.path().join("dir1/sub/keep.txt"), "keep")?;
+
+    let resp = fetch!(b"DELETE", format!("{}dir1/sub/keep.txt", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(error_code(&resp), Some("forbidden"));
+
+    let resp = fetch!(b"DELETE", format!("{}dir1", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(error_code(&resp), Some("readonly-descendant"));
+    assert!(server.path().join("dir1/sub/keep.txt").exists());
+    Ok(())
+}
+
+#[rstest]
+fn move_ancestor_denied_with_restricted_child(
+    #[with(&["--auth", "user:pass@/:rw,/dir1:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = fetch!(b"MOVE", server.url())
+        .basic_auth("user", Some("pass"))
+        .header("Destination", format!("{}moved", server.url()))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(error_code(&resp), Some("readonly-descendant"));
+    assert!(server.path().join("dir1/test.txt").exists());
+    Ok(())
+}
+
+#[rstest]
+fn move_ancestor_denied_with_restricted_nested_path(
+    #[with(&["--auth", "user:pass@/:rw,/dir1/sub:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    std::fs::create_dir_all(server.path().join("dir1/sub"))?;
+    std::fs::write(server.path().join("dir1/sub/keep.txt"), "keep")?;
+
+    let resp = fetch!(b"MOVE", format!("{}dir1", server.url()))
+        .basic_auth("user", Some("pass"))
+        .header("Destination", format!("{}moved", server.url()))
+        .send()?;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(error_code(&resp), Some("readonly-descendant"));
+    assert!(server.path().join("dir1/sub/keep.txt").exists());
+    Ok(())
+}
+
+/// Recursive operations stay available when the subtree has no restricted
+/// descendant rule.
+#[rstest]
+fn recursive_ops_allowed_without_restricted_descendant(
+    #[with(&["--auth", "user:pass@/:rw,/dir1:ro", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = fetch!(b"DELETE", format!("{}dir2", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    assert!(!server.path().join("dir2").exists());
+
+    let resp = fetch!(b"MOVE", format!("{}dir3", server.url()))
+        .basic_auth("user", Some("pass"))
+        .header("Destination", format!("{}dir3-moved", server.url()))
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    assert!(!server.path().join("dir3").exists());
+    assert!(server.path().join("dir3-moved").exists());
+    assert!(server.path().join("dir1/test.txt").exists());
     Ok(())
 }

@@ -4,6 +4,9 @@
  * @property {string} name
  * @property {number} mtime
  * @property {number} size
+ * @property {boolean} allow_upload
+ * @property {boolean} allow_delete
+ * @property {boolean} readonly_descendant
  */
 
 /**
@@ -118,8 +121,7 @@ const beforeUnloadHandler = (event) => {
   }
 };
 
-// Produce table when window loads
-window.addEventListener("DOMContentLoaded", async () => {
+async function initialize() {
   const $indexData = document.getElementById('index-data');
   if (!$indexData) {
     alert("No data");
@@ -130,7 +132,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   DIR_EMPTY_NOTE = PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
 
   await ready();
-});
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initialize, {
+    once: true,
+  });
+} else {
+  queueMicrotask(initialize);
+}
 
 async function ready() {
   $pathsTable = document.querySelector(".paths-table");
@@ -175,8 +185,30 @@ class Uploader {
     /**
      * @type Element
      */
-    this.$uploadStatus = null
-    this.uploaded = 0;
+    this.$status = null;
+    /**
+     * @type Element
+     */
+    this.$size = null;
+    /**
+     * @type Element
+     */
+    this.$percent = null;
+    /**
+     * @type Element
+     */
+    this.$speed = null;
+    /**
+     * @type Element
+     */
+    this.$eta = null;
+    // speed ring buffer, mirrors curl's progress meter (6 records, one per
+    // second, giving a 5-second window) so the displayed speed stays stable
+    this.startTime = 0;
+    this.speedRecords = 0;
+    this.speedAmounts = [];
+    this.speedTimes = [];
+    this.currentSpeed = 0;
     this.uploadOffset = 0;
     this.lastUptime = 0;
     this.name = [...pathParts, file.name].join("/");
@@ -196,13 +228,23 @@ class Uploader {
     <td class="path cell-name">
       <a href="${url}">${encodedName}</a>
     </td>
-    <td class="cell-status upload-status" id="uploadStatus${idx}"></td>
+    <td class="cell-status" id="uploadStatus${idx}"></td>
+    <td class="cell-size" id="uploadSize${idx}"></td>
+    <td class="cell-percent" id="uploadPercent${idx}"></td>
+    <td class="cell-speed" id="uploadSpeed${idx}"></td>
+    <td class="cell-eta" id="uploadEta${idx}"></td>
   </tr>`);
     $uploadersTable.classList.remove("hidden");
     $emptyFolder.classList.add("hidden");
-    this.$uploadStatus = document.getElementById(`uploadStatus${idx}`);
-    this.$uploadStatus.innerHTML = '-';
-    this.$uploadStatus.addEventListener("click", e => {
+    this.$status = document.getElementById(`uploadStatus${idx}`);
+    this.$percent = document.getElementById(`uploadPercent${idx}`);
+    this.$size = document.getElementById(`uploadSize${idx}`);
+    this.$speed = document.getElementById(`uploadSpeed${idx}`);
+    this.$eta = document.getElementById(`uploadEta${idx}`);
+    this.$status.textContent = "-";
+    this.$percent.textContent = formatPercent(0);
+    this.$size.textContent = formatUploadSize(0, this.file.size);
+    this.$status.addEventListener("click", e => {
       const nodeId = e.target.id;
       const matches = /^retry(\d+)$/.exec(nodeId);
       if (matches) {
@@ -218,8 +260,13 @@ class Uploader {
   ajax() {
     const { url } = this;
 
-    this.uploaded = 0;
-    this.lastUptime = Date.now();
+    this.startTime = Date.now();
+    this.lastUptime = this.startTime;
+    this.speedRecords = 1;
+    this.speedAmounts = [0];
+    this.speedTimes = [0];
+    this.currentSpeed = 0;
+    this.$status.textContent = "↑";
 
     const ajax = new XMLHttpRequest();
     ajax.upload.addEventListener("progress", e => this.progress(e), false);
@@ -229,7 +276,16 @@ class Uploader {
           this.complete();
         } else {
           if (ajax.status != 0) {
-            this.fail(`${ajax.status} ${ajax.statusText}`);
+            const code = ajax.getResponseHeader("x-dufs-error-code");
+            if (code === "upload-disabled") {
+              this.fail("upload is disabled");
+            } else if (code === "delete-disabled") {
+              this.fail("overwriting is disabled");
+            } else if (code === "readonly-descendant") {
+              this.fail("directory contains read-only entries");
+            } else {
+              this.fail(`${ajax.status} ${ajax.statusText}`);
+            }
           }
         }
       }
@@ -263,30 +319,55 @@ class Uploader {
 
   progress(event) {
     const now = Date.now();
-    const elapsed = now - this.lastUptime;
-    if (elapsed < 300) return; // throttle update for safari
-    const speed = (event.loaded - this.uploaded) / elapsed * 1000;
-    const [speedValue, speedUnit] = formatFileSize(speed);
-    const speedText = `${speedValue} ${speedUnit}/s`;
-    const progress = formatPercent(((event.loaded + this.uploadOffset) / this.file.size) * 100);
-    const duration = formatDuration((event.total - event.loaded) / speed);
-    this.$uploadStatus.innerHTML = `<span style="width: 80px;">${speedText}</span><span style="margin-left: 5px;">${progress} ${duration}</span>`;
-    this.uploaded = event.loaded;
+    this.calcSpeed(now - this.startTime, event.loaded);
+    if (now - this.lastUptime < 300) return; // throttle update for safari
     this.lastUptime = now;
+    const uploadedSize = event.loaded + this.uploadOffset;
+    const [speedValue, speedUnit] = formatFileSize(this.currentSpeed);
+    this.$status.textContent = "↑";
+    this.$percent.textContent = formatPercent((uploadedSize / this.file.size) * 100);
+    this.$size.textContent = formatUploadSize(uploadedSize, this.file.size);
+    this.$speed.textContent = `${speedValue} ${speedUnit}/s`;
+    this.$eta.textContent = formatDuration(this.currentSpeed > 0 ? (event.total - event.loaded) / this.currentSpeed : Infinity);
+  }
+
+  /**
+   * Update the smoothed speed using curl's progress meter algorithm: keep a
+   * 6-record ring buffer (one record per second, a 5-second window), add a
+   * record at most once per second, and average over the buffered window.
+   * @param {number} elapsed milliseconds since the transfer started
+   * @param {number} amount bytes transferred so far
+   */
+  calcSpeed(elapsed, amount) {
+    const records = 6;
+    const iNext = this.speedRecords % records;
+    let iLatest = iNext > 0 ? iNext - 1 : records - 1;
+    if (elapsed - this.speedTimes[iLatest] < 1000) return;
+    this.speedRecords++;
+    iLatest = iNext;
+    this.speedAmounts[iLatest] = amount;
+    this.speedTimes[iLatest] = elapsed;
+    const iOldest = this.speedRecords < records ? 0 : (iLatest + 1) % records;
+    const duration = this.speedTimes[iLatest] - this.speedTimes[iOldest];
+    const delta = this.speedAmounts[iLatest] - this.speedAmounts[iOldest];
+    this.currentSpeed = duration > 0 ? delta / duration * 1000 : 0;
   }
 
   complete() {
-    const $uploadStatusNew = this.$uploadStatus.cloneNode(true);
-    $uploadStatusNew.innerHTML = `✓`;
-    this.$uploadStatus.parentNode.replaceChild($uploadStatusNew, this.$uploadStatus);
-    this.$uploadStatus = null;
+    this.$status.textContent = "✓";
+    this.$percent.textContent = formatPercent(100);
+    this.$size.textContent = formatUploadSize(this.file.size, this.file.size);
+    this.$speed.textContent = "";
+    this.$eta.textContent = "";
     failUploaders.delete(this.idx);
     Uploader.runnings--;
     Uploader.runQueue();
   }
 
   fail(reason = "") {
-    this.$uploadStatus.innerHTML = `<span style="width: 20px;" title="${reason}">✗</span><span class="retry-btn" id="retry${this.idx}" title="Retry">↻</span>`;
+    this.$status.innerHTML = `<span title="${reason}">✗</span><span class="retry-btn" id="retry${this.idx}" title="Retry">↻</span>`;
+    this.$speed.textContent = "";
+    this.$eta.textContent = "";
     failUploaders.set(this.idx, this);
     Uploader.runnings--;
     Uploader.runQueue();
@@ -442,8 +523,15 @@ function renderPathsTableBody() {
     if (len > 0) {
       $pathsTable.classList.remove("hidden");
     }
+    // Show an action column when it is available for the current directory or
+    // at least one entry. Rows without permission render the action disabled.
+    const showMove =
+      (DATA.allow_upload && DATA.allow_delete) ||
+      DATA.paths.some((p) => p?.allow_upload && p?.allow_delete);
+    const showDelete =
+      DATA.allow_delete || DATA.paths.some((p) => p?.allow_delete);
     for (let i = 0; i < len; i++) {
-      addPath(DATA.paths[i], i);
+      addPath(DATA.paths[i], i, showMove, showDelete);
     }
   } else {
     $emptyFolder.textContent = DIR_EMPTY_NOTE;
@@ -452,11 +540,37 @@ function renderPathsTableBody() {
 }
 
 /**
+ * Render an action button that the current account cannot use.
+ * @param {string} icon
+ * @param {string} title
+ */
+function disabledAction(icon, title) {
+  return `<span class="action-btn disabled" title="${title}" aria-disabled="true">${icon}</span>`;
+}
+
+/**
+ * Explain why an entry cannot be modified by the current account.
+ * @param {PathItem} file
+ * @param {"move" | "delete" | "edit"} action
+ */
+function deniedReason(file, action) {
+  if (file.readonly_descendant) {
+    return "the directory contains read-only entries";
+  }
+  if (action === "edit") {
+    return "the file is read-only";
+  }
+  return "the entry is read-only";
+}
+
+/**
  * Add pathitem
  * @param {PathItem} file
  * @param {number} index
+ * @param {boolean} showMove
+ * @param {boolean} showDelete
  */
-function addPath(file, index) {
+function addPath(file, index, showMove, showDelete) {
   const encodedName = encodedStr(file.name);
   let url = newUrl(file.name);
   let actionDelete = "";
@@ -479,17 +593,31 @@ function addPath(file, index) {
       <a class="dlwt" href="${url}" title="Download file" download>${ICONS.download}</a>
     </div>`;
   }
-  if (DATA.allow_delete) {
-    if (DATA.allow_upload) {
+  const canMove = file.allow_upload && file.allow_delete;
+  const canEdit = !isDir && canMove;
+  if (showMove) {
+    if (canMove) {
       actionMove = `<div onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename">${ICONS.move}</div>`;
-      if (!isDir) {
+    } else {
+      actionMove = disabledAction(ICONS.move, `Cannot move: ${deniedReason(file, "move")}`);
+    }
+    if (!isDir) {
+      if (canEdit) {
         actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit">${ICONS.edit}</a>`;
+      } else {
+        actionEdit = disabledAction(ICONS.edit, `Cannot edit: ${deniedReason(file, "edit")}`);
       }
     }
-    actionDelete = `
-    <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${ICONS.delete}</div>`;
   }
-  if (!actionEdit && !isDir) {
+  if (showDelete) {
+    if (file.allow_delete) {
+      actionDelete = `
+    <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${ICONS.delete}</div>`;
+    } else {
+      actionDelete = disabledAction(ICONS.delete, `Cannot delete: ${deniedReason(file, "delete")}`);
+    }
+  }
+  if (!canEdit && !isDir) {
     actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
   }
   let actionCell = `
@@ -638,27 +766,31 @@ async function setupEditorPage() {
   $download.href = url;
 
   if (DATA.kind == "Edit") {
-    const $moveFile = document.querySelector(".move-file");
-    $moveFile.classList.remove("hidden");
-    $moveFile.addEventListener("click", async () => {
-      const query = location.href.slice(url.length);
-      const newFileUrl = await doMovePath(url);
-      if (newFileUrl) {
-        location.href = newFileUrl + query;
-      }
-    });
-
-    const $deleteFile = document.querySelector(".delete-file");
-    $deleteFile.classList.remove("hidden");
-    $deleteFile.addEventListener("click", async () => {
-      const url = baseUrl();
-      const name = baseName(url);
-      await doDeletePath(name, url, () => {
-        location.href = location.href.split("/").slice(0, -1).join("/");
+    if (DATA.allow_upload && DATA.allow_delete) {
+      const $moveFile = document.querySelector(".move-file");
+      $moveFile.classList.remove("hidden");
+      $moveFile.addEventListener("click", async () => {
+        const query = location.href.slice(url.length);
+        const newFileUrl = await doMovePath(url);
+        if (newFileUrl) {
+          location.href = newFileUrl + query;
+        }
       });
-    });
+    }
 
-    if (DATA.editable) {
+    if (DATA.allow_delete) {
+      const $deleteFile = document.querySelector(".delete-file");
+      $deleteFile.classList.remove("hidden");
+      $deleteFile.addEventListener("click", async () => {
+        const url = baseUrl();
+        const name = baseName(url);
+        await doDeletePath(name, url, () => {
+          location.href = location.href.split("/").slice(0, -1).join("/");
+        });
+      });
+    }
+
+    if (DATA.editable && DATA.allow_upload) {
       const $saveBtn = document.querySelector(".save-btn");
       $saveBtn.classList.remove("hidden");
       $saveBtn.addEventListener("click", saveChange);
@@ -681,6 +813,7 @@ async function setupEditorPage() {
   }
 
   $editor.classList.remove("hidden");
+  $editor.readonly = DATA.kind == "View" || !DATA.allow_upload;
   try {
     const res = await fetch(baseUrl());
     await assertResOK(res);
@@ -728,7 +861,13 @@ async function doDeletePath(name, url, cb) {
     await assertResOK(res);
     cb();
   } catch (err) {
-    alert(`Cannot delete \`${file.name}\`, ${err.message}`);
+    if (err.code === "readonly-descendant") {
+      alert(`Cannot delete \`${name}\`: the directory contains read-only entries`);
+    } else if (err.code === "delete-disabled") {
+      alert(`Cannot delete \`${name}\`: delete is disabled`);
+    } else {
+      alert(`Cannot delete \`${name}\`, ${err.message}`);
+    }
   }
 }
 
@@ -779,7 +918,13 @@ async function doMovePath(fileUrl) {
     await assertResOK(res2);
     return newFileUrl;
   } catch (err) {
-    alert(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
+    if (err.code === "readonly-descendant") {
+      alert(`Cannot move \`${filePath}\`: the directory contains read-only entries`);
+    } else if (err.code === "upload-disabled" || err.code === "delete-disabled") {
+      alert(`Cannot move \`${filePath}\`: moving is disabled`);
+    } else {
+      alert(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
+    }
   }
 }
 
@@ -836,7 +981,13 @@ async function createFolder(name) {
     await assertResOK(res);
     location.href = url;
   } catch (err) {
-    alert(`Cannot create folder \`${name}\`, ${err.message}`);
+    if (err.code === "already-exists") {
+      alert(`Cannot create folder \`${name}\`: it already exists`);
+    } else if (err.code === "upload-disabled") {
+      alert(`Cannot create folder \`${name}\`: upload is disabled`);
+    } else {
+      alert(`Cannot create folder \`${name}\`, ${err.message}`);
+    }
   }
 }
 
@@ -851,7 +1002,13 @@ async function createFile(name) {
     await assertResOK(res);
     location.href = url + "?edit";
   } catch (err) {
-    alert(`Cannot create file \`${name}\`, ${err.message}`);
+    if (err.code === "upload-disabled") {
+      alert(`Cannot create file \`${name}\`: upload is disabled`);
+    } else if (err.code === "delete-disabled") {
+      alert(`Cannot create file \`${name}\`: delete is disabled`);
+    } else {
+      alert(`Cannot create file \`${name}\`, ${err.message}`);
+    }
   }
 }
 
@@ -936,35 +1093,33 @@ function formatDirSize(size) {
   return ` ${num} ${unit}`;
 }
 
-function formatFileSize(size) {
-  if (size == null) return [0, "B"];
+function formatFileSize(size, unit) {
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  if (size == 0) return [0, "B"];
-  const i = parseInt(Math.floor(Math.log(size) / Math.log(1024)));
-  const raw = size / Math.pow(1024, i);
-  let value;
-  if (i > 0 && raw < 999.95) {
-    value = Math.round(raw * 10) / 10;
-  } else {
-    value = Math.round(raw);
-  }
-  return [value, sizes[i]];
+  const i = Math.max(0, unit ? sizes.indexOf(unit) : (size > 0 ? parseInt(Math.floor(Math.log(size) / Math.log(1024))) : 0));
+  const raw = size > 0 ? size / Math.pow(1024, i) : 0;
+  if (i === 0) return [Math.round(raw), "B"];
+  return [raw.toFixed(1), sizes[i]];
 }
 
 function formatDuration(seconds) {
+  if (!isFinite(seconds) || seconds <= 0) return "--:--";
   seconds = Math.ceil(seconds);
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds - h * 3600) / 60);
   const s = seconds - h * 3600 - m * 60;
-  return `${padZero(h, 2)}:${padZero(m, 2)}:${padZero(s, 2)}`;
+  if (h > 0) return `${padZero(h, 2)}:${padZero(m, 2)}:${padZero(s, 2)}`;
+  return `${padZero(m, 2)}:${padZero(s, 2)}`;
+}
+
+function formatUploadSize(uploaded, total) {
+  const unit = formatFileSize(total)[1];
+  const [uploadedValue] = formatFileSize(uploaded, unit);
+  const [totalValue] = formatFileSize(total, unit);
+  return `${uploadedValue}/${totalValue} ${unit}`;
 }
 
 function formatPercent(percent) {
-  if (percent > 10) {
-    return percent.toFixed(1) + "%";
-  } else {
-    return percent.toFixed(2) + "%";
-  }
+  return Math.round(percent) + "%";
 }
 
 function encodedStr(rawStr) {
@@ -975,7 +1130,9 @@ function encodedStr(rawStr) {
 
 async function assertResOK(res) {
   if (!(res.status >= 200 && res.status < 300)) {
-    throw new Error(await res.text() || `Invalid status ${res.status}`);
+    const err = new Error(await res.text() || `Invalid status ${res.status}`);
+    err.code = res.headers.get("x-dufs-error-code");
+    throw err;
   }
 }
 
